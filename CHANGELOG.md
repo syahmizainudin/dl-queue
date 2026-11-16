@@ -4,6 +4,8 @@ Each release has a `## <version>` section. The release pipeline publishes that s
 
 ## Unreleased
 
+- The folder picker keeps one size; long folder lists scroll inside it instead of resizing the window.
+
 ## 0.3.0
 
 No change to downloading. This release keeps dl-queue's copy of the console server identical to cbz-webp 0.3.0, as harbor requires: APIs may answer `GET` requests, `serve` takes extra `pages`, and pages may be framed by the same origin (`SAMEORIGIN`).
