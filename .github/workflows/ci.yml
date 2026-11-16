@@ -1,0 +1,78 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_call: # the release workflow runs this first
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  RUFF_VERSION: "0.17.5"
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+      - run: pip install "ruff==${RUFF_VERSION}"
+      - name: Lint
+        run: ruff check --output-format=github .
+      - name: Format
+        run: ruff format --check .
+
+  test:
+    name: test (Python ${{ matrix.python }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.10", "3.11", "3.12", "3.13", "3.14"]
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: ${{ matrix.python }}
+          allow-prereleases: true
+      - name: Unit tests (standard library only, no installs)
+        run: python -m unittest discover -s tests -v
+
+  package:
+    needs: [lint, test]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+      - run: pip install build
+      - name: Build sdist and wheel
+        run: python -m build
+      - name: Install the wheel in a clean venv and run it
+        run: |
+          python -m venv /tmp/smoke
+          /tmp/smoke/bin/pip install dist/*.whl
+          /tmp/smoke/bin/dl-queue --version
+          mkdir -p /tmp/site/files /tmp/out
+          echo "hello" > "/tmp/site/files/Chapter 01.zip"
+          python -m http.server 8901 --bind 127.0.0.1 --directory /tmp/site &
+          for i in $(seq 1 20); do curl -sf http://127.0.0.1:8901/ >/dev/null && break; sleep 0.25; done
+          /tmp/smoke/bin/dl-queue get "http://127.0.0.1:8901/files/Chapter%2001.zip" --to /tmp/out
+          test "$(cat '/tmp/out/Chapter 01.zip')" = "hello"
+          test -z "$(ls /tmp/out/*.part 2>/dev/null)"
+          /tmp/smoke/bin/python -c "import dlqueue.web"  # ui.html is packaged
+      - uses: actions/upload-artifact@v5
+        with:
+          name: dist
+          path: dist/
+          if-no-files-found: error

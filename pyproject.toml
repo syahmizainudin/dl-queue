@@ -1,0 +1,33 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "dl-queue"
+dynamic = ["version"]
+description = "Download files from direct URLs through a queue, with an optional API key"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = []
+
+[project.scripts]
+dl-queue = "dlqueue.cli:main"
+
+[tool.setuptools]
+packages = ["dlqueue"]
+
+[tool.setuptools.package-data]
+dlqueue = ["ui.html"]
+
+[tool.setuptools.dynamic]
+version = { attr = "dlqueue.__version__" }
+
+[tool.ruff]
+line-length = 110
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "B", "BLE", "UP", "RUF"]
+ignore = [
+  "RUF001",  # ambiguous unicode in strings: the "…" in messages is intended
+]
