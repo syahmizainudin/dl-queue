@@ -4,6 +4,13 @@ Each release has a `## <version>` section. The release pipeline publishes that s
 
 ## Unreleased
 
+## 0.4.0
+
+- The console server can require sign-in, for tools built on it (harbor's accounts): No change to downloading.
+  - `serve(..., auth=...)` takes an object that says who sent each request and which requests are allowed signed out. Signed-out page requests are sent to the sign-in page, and API requests get 401.
+  - `current_user()` names the signed-in user while an API handles a request.
+  - An API's `post` may return extra response headers, such as `Set-Cookie`.
+  Without `auth`, nothing changes.
 - The folder picker keeps one size; long folder lists scroll inside it instead of resizing the window.
 
 ## 0.3.0

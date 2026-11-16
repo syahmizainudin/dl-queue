@@ -17,7 +17,7 @@ from helpers import FileServer
 from dlqueue import __version__, cli
 from dlqueue.basequeue import CANCELLED, DONE, FAILED
 from dlqueue.download import DownloadQueue
-from dlqueue.web import serve_downloads
+from dlqueue.web import current_user, serve, serve_downloads
 
 KEY = FileServer.KEY
 
@@ -290,6 +290,92 @@ class WebTests(TmpDir):
             self.assertEqual(bad[0], 403)
         finally:
             self.port = port
+
+
+class AuthServerTests(TmpDir):
+    """With ``auth``, the server asks it who each request is from and refuses the signed-out."""
+
+    class FakeAuth:
+        login_path = "/login"
+
+        def public(self, method, path):
+            return (method, path) in {("GET", "/login"), ("POST", "/api/me/login")}
+
+        def user(self, headers):
+            return {"t1": "ann", "t2": "bo"}.get(headers.get("X-Token", ""))
+
+    class MeAPI:
+        def __init__(self):
+            self.seen = []
+
+        def state(self):
+            return {"me": current_user()}
+
+        def post(self, action, body):
+            self.seen.append(current_user())
+            if action == "login":
+                return 200, {"ok": True}, {"Set-Cookie": "s=1; HttpOnly"}
+            return 200, {"user": current_user()}
+
+        def get(self, action, query):
+            return 200, {"Content-Type": "application/json"}, json.dumps({"user": current_user()}).encode()
+
+    def setUp(self):
+        super().setUp()
+        self.me = self.MeAPI()
+        self.server = serve(
+            0, b"<title>Main</title>", {"/api/me/": self.me}, pages={"/login": b"login"}, auth=self.FakeAuth()
+        )
+        self.port = self.server.server_address[1]
+        threading.Thread(target=self.server.serve_forever, daemon=True).start()
+
+    def tearDown(self):
+        self.server.shutdown()
+        self.server.server_close()
+        super().tearDown()
+
+    def req(self, method, path, token=None, body=None):
+        conn = http.client.HTTPConnection("127.0.0.1", self.port, timeout=10)
+        headers = {"X-Token": token} if token else {}
+        if body is not None:
+            headers["Content-Type"] = "application/json"
+        conn.request(
+            method, path, body=json.dumps(body).encode() if body is not None else None, headers=headers
+        )
+        resp = conn.getresponse()
+        data, h = resp.read(), dict(resp.getheaders())
+        conn.close()
+        return resp.status, h, data
+
+    def test_signed_out_requests_are_refused(self):
+        status, h, _ = self.req("GET", "/")
+        self.assertEqual((status, h["Location"]), (303, "/login"))
+        for method, path, body in (
+            ("GET", "/api/state", None),
+            ("GET", "/api/dirs", None),
+            ("GET", "/api/me/x", None),
+            ("POST", "/api/me/x", {}),
+        ):
+            with self.subTest(path=path):
+                self.assertEqual(self.req(method, path, body=body)[0], 401)
+        self.assertEqual(self.me.seen, [])
+        self.assertEqual(self.req("GET", "/login")[2], b"login")  # public
+
+    def test_public_post_can_set_headers(self):
+        status, h, data = self.req("POST", "/api/me/login", body={})
+        self.assertEqual((status, h["Set-Cookie"], json.loads(data)), (200, "s=1; HttpOnly", {"ok": True}))
+        self.assertEqual(self.me.seen, [None])  # public, signed out
+
+    def test_each_request_sees_its_own_user(self):
+        self.assertEqual(self.req("GET", "/", token="t1")[0], 200)
+        self.assertEqual(json.loads(self.req("GET", "/api/state", token="t1")[2]), {"me": "ann"})
+        self.assertEqual(json.loads(self.req("GET", "/api/me/x", token="t2")[2]), {"user": "bo"})
+        self.assertEqual(json.loads(self.req("POST", "/api/me/x", token="t2", body={})[2]), {"user": "bo"})
+        self.assertIsNone(current_user())  # nothing leaks outside a request
+        self.assertEqual(self.req("GET", "/api/state", token="nope")[0], 401)
+
+    def test_without_auth_there_is_no_user(self):
+        self.assertIsNone(current_user())
 
 
 if __name__ == "__main__":

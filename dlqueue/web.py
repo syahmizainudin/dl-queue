@@ -5,9 +5,11 @@ page HTML and a map of URL prefix -> API object. An API object has
 
     state() -> dict                         merged into GET /api/state
     post(action, body) -> (status, dict)    POST <prefix><action>
+                       or (status, dict, headers)
 
 The server adds the request guards, ``GET /api/dirs`` for the folder picker, and turns
-``ValueError``/``OSError``/``KeyError`` from an API into a 400.
+``ValueError``/``OSError``/``KeyError`` from an API into a 400. With ``auth``, every request
+except the ones ``auth`` makes public needs a signed-in user, and ``current_user()`` names it.
 
 cbz-webp has an identical copy of the generic part; keep the two in step.
 """
@@ -17,6 +19,7 @@ from __future__ import annotations
 import json
 import os
 import string
+import threading
 from collections.abc import Iterable
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -34,8 +37,35 @@ UI_HTML = (Path(__file__).parent / "ui.html").read_bytes()
 # Everything from here to "end of generic server part" is identical in dl-queue's web.py.
 
 
+_request = threading.local()  # one thread per request (ThreadingHTTPServer)
+
+
+def current_user():
+    """The signed-in user of the request being handled, as ``auth.user`` returned it.
+    None without ``auth``, or for a public request from someone signed out."""
+    return getattr(_request, "user", None)
+
+
+class SignIn(Protocol):
+    """Sign-in for ``serve(auth=...)``. The host owns accounts and sessions; the server only asks.
+
+        public(method, path) -> bool    requests allowed signed out (the sign-in page and action)
+        user(headers) -> object | None  who sent the request (from a session cookie or a token)
+        login_path                      where a signed-out browser asking for a page is sent
+
+    Signed out, a page request gets 303 to ``login_path`` and anything else 401.
+    """
+
+    login_path: str
+
+    def public(self, method: str, path: str) -> bool: ...
+
+    def user(self, headers) -> object | None: ...
+
+
 class API(Protocol):
-    """``state`` and ``post`` are required. An API may also define
+    """``state`` and ``post`` are required. ``post`` may return a third item, extra response
+    headers (such as ``Set-Cookie``). An API may also define
 
         get(action, query) -> (status, headers, body)
 
@@ -93,6 +123,7 @@ def make_handler(
     count_exts: Iterable[str] | None = None,
     allowed_origins: Iterable[str] = (),
     pages: dict[str, bytes] | None = None,
+    auth: SignIn | None = None,
 ):
     """``allowed_origins``: exact extra origins (such as ``chrome-extension://<id>``) whose POSTs are
     accepted besides the page's own. Browsers set ``Origin`` themselves, so pages and other
@@ -122,8 +153,22 @@ def make_handler(
             self.end_headers()
             self.wfile.write(body)
 
-        def _json(self, obj, status: int = 200) -> None:
-            self._send(status, json.dumps(obj).encode(), "application/json")
+        def _json(self, obj, status: int = 200, headers: dict | None = None) -> None:
+            self._send(status, json.dumps(obj).encode(), "application/json", headers)
+
+        def _signed_in(self, method: str, path: str) -> bool:
+            """Record the request's user. False after answering a signed-out request."""
+            _request.user = None
+            if auth is None:
+                return True
+            _request.user = auth.user(self.headers)
+            if _request.user is not None or auth.public(method, path):
+                return True
+            if method == "GET" and path in all_pages:
+                self._send(HTTPStatus.SEE_OTHER, b"", "text/plain", {"Location": auth.login_path})
+            else:
+                self._json({"error": "sign in first"}, HTTPStatus.UNAUTHORIZED)
+            return False
 
         def _host_ok(self) -> bool:
             port = self.server.server_address[1]
@@ -141,6 +186,13 @@ def make_handler(
             # Checking Host also stops DNS rebinding from reading the API.
             if not self._host_ok():
                 return self._send(HTTPStatus.FORBIDDEN, b"bad host", "text/plain")
+            try:
+                if self._signed_in("GET", urlsplit(self.path).path):
+                    self._get()
+            finally:
+                _request.user = None
+
+        def _get(self):
             url = urlsplit(self.path)
             if url.path in all_pages:
                 return self._send(200, all_pages[url.path], "text/html; charset=utf-8")
@@ -174,6 +226,13 @@ def make_handler(
             if self.headers.get("Content-Type", "").split(";")[0].strip() != "application/json":
                 return self._json({"error": "JSON only"}, HTTPStatus.UNSUPPORTED_MEDIA_TYPE)
             try:
+                if self._signed_in("POST", urlsplit(self.path).path):
+                    self._post()
+            finally:
+                _request.user = None
+
+        def _post(self):
+            try:
                 length = int(self.headers.get("Content-Length", 0))
                 body = json.loads(self.rfile.read(length) or b"{}")
                 if not isinstance(body, dict):
@@ -185,10 +244,10 @@ def make_handler(
             for prefix, api in routes:
                 if path.startswith(prefix) and "/" not in path[len(prefix) :]:
                     try:
-                        status, obj = api.post(path[len(prefix) :], body)
+                        status, obj, *extra = api.post(path[len(prefix) :], body)
                     except (OSError, ValueError, KeyError, TypeError) as e:
                         return self._json({"error": str(e)}, HTTPStatus.BAD_REQUEST)
-                    return self._json(obj, status)
+                    return self._json(obj, status, extra[0] if extra else None)
             self._json({"error": "not found"}, HTTPStatus.NOT_FOUND)
 
     return Handler
@@ -201,8 +260,9 @@ def serve(
     count_exts: Iterable[str] | None = None,
     allowed_origins: Iterable[str] = (),
     pages: dict[str, bytes] | None = None,
+    auth: SignIn | None = None,
 ) -> ThreadingHTTPServer:
-    handler = make_handler(page, apis, count_exts, allowed_origins, pages)
+    handler = make_handler(page, apis, count_exts, allowed_origins, pages, auth)
     server = ThreadingHTTPServer(("127.0.0.1", port), handler)
     server.daemon_threads = True
     return server
