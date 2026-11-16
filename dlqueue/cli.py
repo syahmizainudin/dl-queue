@@ -54,10 +54,16 @@ def build_parser() -> argparse.ArgumentParser:
     g.add_argument(
         "--timeout", type=float, default=60, help="seconds without data before giving up (default 60)"
     )
+    g.add_argument(
+        "--retries", type=int, default=3, help="extra attempts after a temporary failure (default 3)"
+    )
 
     u = sub.add_parser("ui", help="start the local web console")
     u.add_argument("-p", "--port", type=int, default=8766, help="port on 127.0.0.1 (default 8766)")
     u.add_argument("-d", "--downloads", type=int, default=2, help="downloads at the same time (default 2)")
+    u.add_argument(
+        "--retries", type=int, default=3, help="extra attempts after a temporary failure (default 3)"
+    )
     u.add_argument("--open", action="store_true", help="open the console in a browser")
     return ap
 
@@ -88,6 +94,8 @@ def cmd_get(args) -> int:
         urls = _read_urls(args)
         if args.jobs < 1:
             raise ValueError("--jobs must be at least 1")
+        if args.retries < 0:
+            raise ValueError("--retries must not be negative")
         auth = Auth(args.auth, _key(args), args.name)
     except (OSError, ValueError) as e:
         print(f"dl-queue: {e}", file=sys.stderr)
@@ -102,6 +110,8 @@ def cmd_get(args) -> int:
             if job.state == RUNNING:
                 if not job.message:
                     print(f"[start] {job.url}", flush=True)
+                elif job.message.startswith("retry"):
+                    print(f"[{job.message}] {job.url}", flush=True)
                 return
             if job.state in (DONE, FAILED, CANCELLED):
                 finished[0] += 1
@@ -109,7 +119,7 @@ def cmd_get(args) -> int:
                 where = f" -> {job.output} ({_fmt(job.done)})" if job.state == DONE else ""
                 print(f"[{tag} {finished[0]}/{total[0]}] {job.url}{where} {job.message}", flush=True)
 
-    q = DownloadQueue(workers=args.jobs, timeout=args.timeout, on_change=on_change)
+    q = DownloadQueue(workers=args.jobs, timeout=args.timeout, retries=args.retries, on_change=on_change)
     q.set_paused(True)  # queue everything first, so the progress count is right
     q.start()
     try:
@@ -147,10 +157,10 @@ def cmd_get(args) -> int:
 def cmd_ui(args) -> int:
     from .web import serve_downloads
 
-    if args.downloads < 1:
-        print("dl-queue: --downloads must be at least 1", file=sys.stderr)
+    if args.downloads < 1 or args.retries < 0:
+        print("dl-queue: --downloads must be at least 1 and --retries not negative", file=sys.stderr)
         return 2
-    q = DownloadQueue(workers=args.downloads).start()
+    q = DownloadQueue(workers=args.downloads, retries=args.retries).start()
     try:
         server = serve_downloads(args.port, q)
     except OSError as e:

@@ -31,7 +31,9 @@ It is one of three related repos:
 
 These hold today, and the tests cover each one. Keep them:
 
-1. Data goes to `<name>.part` in the destination folder and is renamed only when complete (byte count equals `Content-Length` when one was sent). Cancel, failure or a short read removes the `.part`.
+1. Data goes to `<name>.part` in the destination folder and is renamed only when complete (byte count equals `Content-Length`, or the `Content-Range` total, when one was sent). Between retry attempts the `.part` is kept for resuming. A cancel or the final failure removes it.
+   - A resume appends only when the response is `206` with a `Content-Range` that starts exactly at the `.part` size, and the request carried `If-Range` with the first response's strong `ETag` or `Last-Modified`. Anything else (a 200, no validator, a weak ETag) truncates and starts over. Never splice bytes from two versions of a file.
+   - Only temporary failures are retried (`_Transient`): connection errors, timeouts, short reads, `RETRY_STATUS` (5xx, 408, 425, 429). Waits use `job.cancel.wait(...)` so cancel is immediate, and are capped at `MAX_DELAY`. Other 4xx fail at once, so a wrong key is never retried.
 2. A download never overwrites a file. `_reserve` picks `name (1).ext` and holds the name under the lock, so two concurrent downloads can't take the same name.
 3. Names from `Content-Disposition` or the URL go through `safe_name`, which strips directories (no `../`) and characters Windows forbids. `filename*` wins over `filename` (RFC 6266).
 4. The destination folder must exist and must not be empty text, which would mean the current directory. Only `http` and `https` URLs are accepted.
@@ -56,13 +58,13 @@ python3 -m unittest discover -s tests
 ruff check . && ruff format --check .
 ```
 
-Both must pass before you hand work back. CI pins ruff (`RUFF_VERSION` in `ci.yml`). On Ubuntu without a venv, install it with `pip install --target <dir> ruff==<version>`. Add tests for any new behaviour: `tests/test_download.py` for the queue, `tests/test_cli_web.py` for CLI flags and HTTP endpoints, `tests/test_release_notes.py` for the release gate.
+Both must pass before you hand work back. CI pins ruff (`RUFF_VERSION` in `ci.yml`). On Ubuntu without a venv, install it with `pip install --target <dir> ruff==<version>`. Add tests for any new behaviour: `tests/test_download.py` for the queue (its `queue()` helper turns retries off unless a test asks for them, so failure tests stay fast), `tests/test_cli_web.py` for CLI flags and HTTP endpoints, `tests/test_release_notes.py` for the release gate.
 
 ## Rules for the code
 
 - **No dependencies.** Standard library only (`urllib`, not `requests`), and the page is plain JS with no CDN. `pyproject.toml` has `dependencies = []`; keep it that way.
 - **Python 3.10+.** CI tests 3.10 through 3.14.
-- **The console stays local and guarded.** It binds `127.0.0.1` only. `POST` requires `Content-Type: application/json`, a `Host` of `127.0.0.1:<port>` or `localhost:<port>`, and a same-origin `Origin` if one is sent. `GET` checks `Host` too, which stops DNS rebinding from reading `/api/state` or `/api/dirs`. New endpoints are actions on an API object (`DownloadAPI.post`), never new branches in the handler. An API raises `ValueError` for bad input, and the server turns it into a 400.
+- **The console stays local and guarded.** It binds `127.0.0.1` only. `POST` requires `Content-Type: application/json`, a `Host` of `127.0.0.1:<port>` or `localhost:<port>`, and a same-origin `Origin` if one is sent. `allowed_origins` adds exact origins (harbor's Chrome extension uses it); never a pattern or a wildcard. `GET` checks `Host` too, which stops DNS rebinding from reading `/api/state` or `/api/dirs`. New endpoints are actions on an API object (`DownloadAPI.post`), never new branches in the handler. An API raises `ValueError` for bad input, and the server turns it into a 400.
 - **Nothing here knows about converting.** Tools built on this pass options through `after` (validated by their `check_after`) and act in `on_saved`. Don't add converter-specific fields to `Download`.
 - **Queue state changes happen under `self._cond`.** Call `_emit` outside the lock. Workers check `job.cancel` between chunks, and `urlopen` has a timeout, so a stalled server can't block cancel forever.
 - **The page must work offline and in dark mode.** Colours are CSS variables on `:root`, with a `prefers-color-scheme: dark` override. `render()` rewrites only the stats and table body every second; keep forms and the folder-picker `<dialog>` outside those. Only per-browser conveniences go in `localStorage` (save-to folder, auth mode), and the API key only when the user ticks "Remember".

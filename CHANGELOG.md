@@ -4,6 +4,12 @@ Each release has a `## <version>` section. The release pipeline publishes that s
 
 ## Unreleased
 
+## 0.2.0
+
+- Temporary failures are retried: timeouts, dropped connections, short reads, HTTP 5xx, 408 and 429. Backoff doubles from 1 s, honours `Retry-After` and is capped at a minute. `--retries` on `get` and `ui` and `DownloadQueue(retries=, backoff=)`; default 3. A job's `attempts` shows how many it took.
+- Big files resume: the `.part` is kept between attempts and continued with `Range` + `If-Range`, so only the missing bytes are fetched. A server that ignores Range, or a file that changed, means starting over.
+- `serve(..., allowed_origins=...)` accepts requests from exact extra origins, such as a browser extension. The page's own origin must now be plain `http`.
+
 ## 0.1.0
 
 First release.

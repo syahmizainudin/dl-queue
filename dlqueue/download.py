@@ -10,11 +10,15 @@ Rules (see AGENTS.md):
   * auth headers are sent with ``add_unredirected_header`` so a redirect to another host (a CDN)
     never receives the key;
   * data is streamed to ``<name>.part`` in the destination folder and renamed when complete;
-    cancel, failure or a short read removes the ``.part``.
+  * temporary failures (timeouts, dropped connections, 5xx, 408/429, short reads) are retried
+    with backoff; the ``.part`` is kept between attempts and continued with an HTTP Range request
+    when the server supports it and the file hasn't changed (``If-Range``). The final failure or
+    a cancel removes the ``.part``.
 """
 
 from __future__ import annotations
 
+import http.client
 import os
 import re
 import threading
@@ -34,6 +38,8 @@ from .paths import PART_SUFFIX, normalize_path
 AUTH_MODES = ("none", "bearer", "header", "query")
 TOKEN_RE = re.compile(r"^[A-Za-z0-9!#$%&'*+.^_`|~-]+$")  # RFC 9110 header-name token
 CHUNK = 256 * 1024
+RETRY_STATUS = {408, 425, 429, 500, 502, 503, 504}
+MAX_DELAY = 60.0  # cap for backoff and Retry-After, in seconds
 USER_AGENT = f"dl-queue/{__version__}"
 
 
@@ -43,6 +49,22 @@ class DownloadCancelled(Exception):
 
 class DownloadError(Exception):
     pass
+
+
+class _Transient(Exception):
+    """A failure worth retrying."""
+
+    def __init__(self, reason: str, retry_after: float | None = None):
+        super().__init__(reason)
+        self.reason = reason
+        self.retry_after = retry_after
+
+
+def _retry_after(headers) -> float | None:
+    try:
+        return max(0.0, float(headers.get("Retry-After", "")))
+    except (TypeError, ValueError):
+        return None  # absent, or an HTTP date: use the normal backoff
 
 
 @dataclass
@@ -121,6 +143,7 @@ class Download:
     filename: str | None = None
     output: str | None = None
     linked_id: int | None = None  # set by the on_saved hook, e.g. a convert job id
+    attempts: int = 0
     added_at: float = field(default_factory=time.time)
     started_at: float | None = None
     finished_at: float | None = None
@@ -152,13 +175,23 @@ class DownloadQueue(BaseQueue):
         on_saved: Callable[[Download, Path], None] | None = None,
         check_after: Callable[[dict], dict] | None = None,
         timeout: float = 60,
+        retries: int = 3,
+        backoff: float = 1.0,
         on_change: Callable | None = None,
     ):
-        """``check_after`` validates/normalizes ``after`` when jobs are added (raise ValueError)."""
+        """``check_after`` validates/normalizes ``after`` when jobs are added (raise ValueError).
+
+        ``retries`` extra attempts follow a temporary failure, waiting ``backoff`` seconds, then
+        twice that, and so on (or the server's ``Retry-After``), capped at a minute.
+        """
         super().__init__(workers, on_change)
+        if retries < 0 or backoff < 0:
+            raise ValueError("retries and backoff must not be negative")
         self.on_saved = on_saved
         self.check_after = check_after
         self.timeout = timeout
+        self.retries = retries
+        self.backoff = backoff
         self._reserved: set[Path] = set()
 
     # ------------------------------------------------------------ commands
@@ -239,42 +272,43 @@ class DownloadQueue(BaseQueue):
         return f"download-{job.id}"
 
     def _run(self, job: Download) -> None:
-        url, headers = job.auth.apply(job.url)
-        req = Request(url, headers={"User-Agent": USER_AGENT})
-        for k, v in headers.items():
-            req.add_unredirected_header(k, v)  # not re-sent on redirect
+        state: dict = {"path": None, "part": None, "validator": None}
         try:
-            with urlopen(req, timeout=self.timeout) as resp:
-                job.total = int(resp.headers.get("Content-Length") or 0)
-                path = self._reserve(Path(job.dest_dir), self._pick_name(job, resp))
-                job.filename = path.name
-                part = path.with_name(path.name + PART_SUFFIX)
+            while True:
+                job.attempts += 1
                 try:
-                    with open(part, "wb") as f:
-                        while chunk := resp.read(CHUNK):
-                            if job.cancel.is_set():
-                                raise DownloadCancelled()
-                            f.write(chunk)
-                            job.done += len(chunk)
-                    if job.total and job.done != job.total:
-                        raise DownloadError(f"connection closed after {job.done} of {job.total} bytes")
-                    os.replace(part, path)
-                except BaseException:
-                    part.unlink(missing_ok=True)
-                    raise
-                finally:
-                    self._release(path)
+                    self._attempt(job, state)
+                    break
+                except _Transient as e:
+                    if job.attempts > self.retries:
+                        tries = f" (gave up after {job.attempts} attempts)" if self.retries else ""
+                        raise DownloadError(e.reason + tries) from e
+                    delay = e.retry_after
+                    if delay is None:
+                        delay = self.backoff * 2 ** (job.attempts - 1)
+                    delay = min(delay, MAX_DELAY)
+                    job.message = f"retry {job.attempts}/{self.retries} in {delay:.0f}s: {e.reason}"
+                    self._emit(job)
+                    if job.cancel.wait(delay):
+                        raise DownloadCancelled() from None
+                    job.message = ""
         except DownloadCancelled:
+            self._discard(state)
             return self._finish(job, CANCELLED, "cancelled; partial file removed")
         except HTTPError as e:
+            self._discard(state)
             return self._finish(job, FAILED, f"HTTP {e.code} {e.reason}")
-        except URLError as e:
-            return self._finish(job, FAILED, f"cannot connect: {e.reason}")
         except DownloadError as e:
+            self._discard(state)
             return self._finish(job, FAILED, str(e))
         except (OSError, ValueError) as e:
+            self._discard(state)
             return self._finish(job, FAILED, f"{type(e).__name__}: {e}")
+        finally:
+            if state["path"] is not None:
+                self._release(state["path"])
 
+        path = state["path"]
         job.output = str(path)
         self._finish(job, DONE, "saved")
         if self.on_saved:
@@ -282,3 +316,69 @@ class DownloadQueue(BaseQueue):
                 self.on_saved(job, path)
             except Exception as e:  # noqa: BLE001 - the file is saved; report the hook's failure
                 job.message = f"saved; after-download step failed: {e}"
+
+    @staticmethod
+    def _discard(state: dict) -> None:
+        if state["part"] is not None:
+            state["part"].unlink(missing_ok=True)
+
+    def _attempt(self, job: Download, state: dict) -> None:
+        """One request. Raises _Transient for failures worth retrying; renames the .part when done."""
+        url, headers = job.auth.apply(job.url)
+        req = Request(url, headers={"User-Agent": USER_AGENT})
+        for k, v in headers.items():
+            req.add_unredirected_header(k, v)  # not re-sent on redirect
+        part: Path | None = state["part"]
+        have = part.stat().st_size if part is not None and part.exists() else 0
+        if have and state["validator"]:
+            # Continue only if the file is unchanged; otherwise the server sends it all (200).
+            req.add_header("Range", f"bytes={have}-")
+            req.add_header("If-Range", state["validator"])
+        else:
+            have = 0
+        try:
+            resp = urlopen(req, timeout=self.timeout)
+        except HTTPError as e:
+            if e.code in RETRY_STATUS:
+                raise _Transient(f"HTTP {e.code} {e.reason}", _retry_after(e.headers)) from e
+            if e.code == 416 and have:  # range not satisfiable: start over
+                part.unlink(missing_ok=True)
+                raise _Transient("server refused to continue; starting over", 0) from e
+            raise
+        except URLError as e:
+            raise _Transient(f"cannot connect: {e.reason}") from e
+        except (TimeoutError, ConnectionError, http.client.HTTPException) as e:
+            raise _Transient(f"connection failed: {e}") from e
+
+        with resp:
+            if state["path"] is None:
+                path = self._reserve(Path(job.dest_dir), self._pick_name(job, resp))
+                state["path"] = path
+                state["part"] = part = path.with_name(path.name + PART_SUFFIX)
+                job.filename = path.name
+            length = int(resp.headers.get("Content-Length") or 0)
+            m = re.match(r"bytes (\d+)-\d+/(\d+|\*)", resp.headers.get("Content-Range", ""))
+            if have and resp.status == 206 and m and int(m.group(1)) == have:
+                mode, job.done = "ab", have
+                job.total = int(m.group(2)) if m.group(2) != "*" else have + length
+            else:
+                mode, job.done, job.total = "wb", 0, length
+                etag = resp.headers.get("ETag", "")
+                state["validator"] = (etag if etag and not etag.startswith("W/") else "") or resp.headers.get(
+                    "Last-Modified"
+                )
+            try:
+                with open(part, mode) as f:
+                    while True:
+                        chunk = resp.read(CHUNK)
+                        if not chunk:
+                            break
+                        if job.cancel.is_set():
+                            raise DownloadCancelled()
+                        f.write(chunk)
+                        job.done += len(chunk)
+            except (TimeoutError, ConnectionError, http.client.HTTPException) as e:
+                raise _Transient(f"connection dropped after {job.done} bytes: {e}") from e
+        if job.total and job.done != job.total:
+            raise _Transient(f"connection closed after {job.done} of {job.total} bytes")
+        os.replace(part, state["path"])

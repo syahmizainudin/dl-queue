@@ -29,6 +29,8 @@ class DownloadTests(unittest.TestCase):
         self.tmp.cleanup()
 
     def queue(self, workers=1, **kw):
+        kw.setdefault("retries", 0)  # tests that want retries ask for them
+        kw.setdefault("backoff", 0.01)
         q = DownloadQueue(workers=workers, timeout=10, **kw).start()
         self.queues.append(q)
         return q
@@ -150,6 +152,76 @@ class DownloadTests(unittest.TestCase):
         q.wait_idle()
         self.assertEqual(q.jobs()[0].state, FAILED)  # same key, same result
         self.assertFalse(q.retry(999))
+
+    # ---------------------------------------------------------- retries and resume
+    def test_retries_then_succeeds(self):
+        q = self.queue(retries=3)
+        (job,), _ = q.add([self.server.base + "/flaky/2/a.bin"], self.dir)
+        q.wait_idle()
+        self.assertEqual((job.state, job.attempts), (DONE, 3), job.message)
+        self.assertEqual((self.dir / "a.bin").read_bytes(), b"data:a.bin")
+
+    def test_gives_up_after_retries(self):
+        q = self.queue(retries=2)
+        (job,), _ = q.add([self.server.base + "/always500"], self.dir)
+        q.wait_idle()
+        self.assertEqual((job.state, job.attempts), (FAILED, 3))
+        self.assertIn("HTTP 500", job.message)
+        self.assertIn("gave up after 3 attempts", job.message)
+        self.assertEqual(self.server.counts["/always500"], 3)
+        self.assertEqual(self.files(), [])
+
+    def test_client_errors_not_retried(self):
+        q = self.queue(retries=3)
+        (job,), _ = q.add([self.server.base + "/secure/a.bin"], self.dir, Auth("bearer", "wrong"))
+        q.wait_idle()
+        self.assertEqual((job.state, job.attempts), (FAILED, 1))
+        self.assertEqual(self.server.counts["/secure/a.bin"], 1)
+
+    def test_retry_after_is_honoured(self):
+        q = self.queue(retries=1, backoff=0)
+        (job,), _ = q.add([self.server.base + "/busy"], self.dir)
+        start = time.monotonic()
+        q.wait_idle()
+        self.assertEqual(job.state, DONE, job.message)
+        self.assertGreaterEqual(time.monotonic() - start, 0.9)
+
+    def test_resume_continues_partial_file(self):
+        q = self.queue(retries=2)
+        (job,), _ = q.add([self.server.base + "/resume/big.bin"], self.dir)
+        q.wait_idle()
+        self.assertEqual((job.state, job.attempts), (DONE, 2), job.message)
+        self.assertEqual((self.dir / "big.bin").read_bytes(), FileServer.RESUME_BODY)
+        second = [r for r in self.server.requests if r["path"] == "/resume/big.bin"][1]["headers"]
+        half = len(FileServer.RESUME_BODY) // 2
+        self.assertEqual((second.get("Range"), second.get("If-Range")), (f"bytes={half}-", '"v1"'))
+        self.assertEqual(self.files(), ["big.bin"])
+
+    def test_server_ignoring_range_restarts_cleanly(self):
+        q = self.queue(retries=2)
+        (job,), _ = q.add([self.server.base + "/noresume/big.bin"], self.dir)
+        q.wait_idle()
+        self.assertEqual(job.state, DONE, job.message)
+        self.assertEqual((self.dir / "big.bin").read_bytes(), FileServer.RESUME_BODY)  # not doubled
+
+    def test_cancel_during_backoff_is_quick_and_cleans_up(self):
+        q = self.queue(retries=5, backoff=30)
+        (job,), _ = q.add([self.server.base + "/resume/big.bin"], self.dir)
+        deadline = time.time() + 10
+        while not job.message.startswith("retry") and time.time() < deadline:
+            time.sleep(0.05)
+        self.assertTrue(job.message.startswith("retry 1/5 in 30s"), job.message)
+        self.assertTrue(list(self.dir.glob("*.part")))  # kept for the next attempt
+        start = time.monotonic()
+        q.cancel(job.id)
+        q.wait_idle()
+        self.assertLess(time.monotonic() - start, 2)
+        self.assertEqual(job.state, CANCELLED)
+        self.assertEqual(self.files(), [])
+
+    def test_negative_settings_rejected(self):
+        with self.assertRaises(ValueError):
+            DownloadQueue(retries=-1)
 
     # ---------------------------------------------------------- after-download hook
     def test_on_saved_hook_gets_job_and_path(self):

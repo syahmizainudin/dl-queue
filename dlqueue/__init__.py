@@ -1,3 +1,3 @@
 """Download direct file URLs through a queue, with an optional API key."""
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"

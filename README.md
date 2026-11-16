@@ -35,7 +35,8 @@ Options for `get`:
 | `--name` | | The header name (`--auth header`, such as `X-API-Key`) or query parameter (`--auth query`, such as `api_key`) |
 | `--key-env` | `DL_QUEUE_KEY` | Environment variable holding the key. If it's not set, `get` asks for the key without showing it |
 | `-j`, `--jobs` | 2 | Downloads at the same time |
-| `--timeout` | 60 | Seconds without data before a download fails |
+| `--timeout` | 60 | Seconds without data before an attempt fails |
+| `--retries` | 3 | Extra attempts after a temporary failure (see below). `0` turns retrying off |
 
 There is no `--key` option on purpose: a key typed on the command line ends up in your shell history. Use the environment variable or the prompt.
 
@@ -47,7 +48,7 @@ dl-queue get https://api.example.com/files/1.zip https://api.example.com/files/2
 
 `get` exits with status 1 if any download failed, 2 for bad arguments, and 130 if you cancelled it with Ctrl+C. Windows paths such as `D:\Downloads` work in WSL and are read as `/mnt/d/Downloads`.
 
-`ui` takes `-d`, `--downloads` (default 2) for the number of downloads at the same time.
+`ui` takes `-d`, `--downloads` (default 2) for the number of downloads at the same time, and `--retries`.
 
 ## Web console
 
@@ -62,7 +63,10 @@ The queue lives in memory, so stopping the console forgets it. The console liste
 
 - **File names** come from the server's `Content-Disposition` header (including UTF-8 names), or else from the URL. Folder parts such as `../` and characters Windows doesn't allow are removed.
 - **Existing files are never overwritten.** A second `Chapter 01.zip` is saved as `Chapter 01 (1).zip`.
-- Each file downloads to `<name>.part` and is renamed only when complete. If the server sent a size, the byte count must match it. A cancelled, failed or incomplete download leaves nothing behind.
+- Each file downloads to `<name>.part` and is renamed only when complete. If the server sent a size, the byte count must match it.
+- **Temporary failures are retried:** timeouts, dropped connections, a download that stops short, HTTP 5xx, 408 and 429. Waits are 1 s, 2 s, 4 s and so on, or the server's `Retry-After`, capped at a minute. Other errors (401, 403, 404, ...) fail at once.
+- **Big files resume.** Between attempts, the `.part` file is kept. If the server supports it, the next attempt asks only for the missing bytes (an HTTP Range request). `If-Range` with the first response's `ETag` or `Last-Modified` makes sure the file hasn't changed in between; otherwise the download starts over.
+- A cancelled or finally failed download leaves nothing behind. Resuming works within one run; a restart starts the file over.
 - **About the API key:**
   - It is never shown in the queue, written to disk or printed.
   - In query mode, the stored URL has no key; the key is added only when the request is made.

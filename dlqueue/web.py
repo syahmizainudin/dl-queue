@@ -78,9 +78,18 @@ def list_dirs(raw: str | None, count_exts: Iterable[str] | None = None) -> dict:
     }
 
 
-def make_handler(page: bytes, apis: dict[str, API], count_exts: Iterable[str] | None = None):
+def make_handler(
+    page: bytes,
+    apis: dict[str, API],
+    count_exts: Iterable[str] | None = None,
+    allowed_origins: Iterable[str] = (),
+):
+    """``allowed_origins``: exact extra origins (such as ``chrome-extension://<id>``) whose POSTs are
+    accepted besides the page's own. Browsers set ``Origin`` themselves, so pages and other
+    extensions can't claim one of these."""
     # Longest prefix first, so a more specific prefix ("/api/download/") wins over "/api/".
     routes = sorted(apis.items(), key=lambda kv: len(kv[0]), reverse=True)
+    extra_origins = frozenset(allowed_origins)
 
     class Handler(BaseHTTPRequestHandler):
         server_version = "local-console"
@@ -109,7 +118,9 @@ def make_handler(page: bytes, apis: dict[str, API], count_exts: Iterable[str] | 
             origin = self.headers.get("Origin")
             if origin is None:
                 return True
-            return urlsplit(origin).netloc == self.headers.get("Host")
+            if origin in extra_origins:
+                return True
+            return urlsplit(origin).scheme == "http" and urlsplit(origin).netloc == self.headers.get("Host")
 
         def do_GET(self):
             # Checking Host also stops DNS rebinding from reading the API.
@@ -159,9 +170,13 @@ def make_handler(page: bytes, apis: dict[str, API], count_exts: Iterable[str] | 
 
 
 def serve(
-    port: int, page: bytes, apis: dict[str, API], count_exts: Iterable[str] | None = None
+    port: int,
+    page: bytes,
+    apis: dict[str, API],
+    count_exts: Iterable[str] | None = None,
+    allowed_origins: Iterable[str] = (),
 ) -> ThreadingHTTPServer:
-    server = ThreadingHTTPServer(("127.0.0.1", port), make_handler(page, apis, count_exts))
+    server = ThreadingHTTPServer(("127.0.0.1", port), make_handler(page, apis, count_exts, allowed_origins))
     server.daemon_threads = True
     return server
 

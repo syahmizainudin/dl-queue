@@ -269,6 +269,28 @@ class WebTests(TmpDir):
         self.assertEqual(self.request("GET", "/api/state", headers={"Host": "evil.example"})[0], 403)
         self.assertEqual(self.state()["downloads"], [])
 
+    def test_allowed_origins(self):
+        from dlqueue.web import UI_HTML, DownloadAPI, serve
+
+        server = serve(
+            0,
+            UI_HTML,
+            {"/api/download/": DownloadAPI(self.queue)},
+            allowed_origins={"chrome-extension://abc"},
+        )
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        self.port, port = server.server_address[1], self.port
+        try:
+            body = {"paused": True}
+            ok = self.post("/api/download/pause", body, headers={"Origin": "chrome-extension://abc"})
+            self.assertEqual(ok[0], 200)
+            bad = self.post("/api/download/pause", body, headers={"Origin": "chrome-extension://xyz"})
+            self.assertEqual(bad[0], 403)
+        finally:
+            self.port = port
+
 
 if __name__ == "__main__":
     unittest.main()
