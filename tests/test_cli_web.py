@@ -304,6 +304,9 @@ class AuthServerTests(TmpDir):
         def user(self, headers):
             return {"t1": "ann", "t2": "bo"}.get(headers.get("X-Token", ""))
 
+        def allows(self, user, method, path):
+            return not (user == "bo" and path == "/api/dirs")  # bo may not browse folders
+
     class MeAPI:
         def __init__(self):
             self.seen = []
@@ -373,6 +376,12 @@ class AuthServerTests(TmpDir):
         self.assertEqual(json.loads(self.req("POST", "/api/me/x", token="t2", body={})[2]), {"user": "bo"})
         self.assertIsNone(current_user())  # nothing leaks outside a request
         self.assertEqual(self.req("GET", "/api/state", token="nope")[0], 401)
+
+    def test_allows_can_refuse_a_signed_in_user(self):
+        self.assertEqual(self.req("GET", "/api/dirs", token="t1")[0], 200)
+        status, _, data = self.req("GET", "/api/dirs", token="t2")
+        self.assertEqual((status, json.loads(data)["error"]), (403, "you don't have permission for this"))
+        self.assertEqual(self.req("GET", "/api/state", token="t2")[0], 200)
 
     def test_without_auth_there_is_no_user(self):
         self.assertIsNone(current_user())

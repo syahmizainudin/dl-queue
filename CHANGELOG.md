@@ -4,6 +4,10 @@ Each release has a `## <version>` section. The release pipeline publishes that s
 
 ## Unreleased
 
+## 0.4.1
+
+- Sign-in: the `auth` object may also define `allows(user, method, path)`. When it returns False, a signed-in request gets 403. Hosts use it for permissions on what the server serves itself, such as the folder browser (`/api/dirs`).
+
 ## 0.4.0
 
 - The console server can require sign-in, for tools built on it (harbor's accounts): No change to downloading.

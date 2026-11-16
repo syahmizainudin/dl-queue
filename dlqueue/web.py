@@ -53,7 +53,10 @@ class SignIn(Protocol):
         user(headers) -> object | None  who sent the request (from a session cookie or a token)
         login_path                      where a signed-out browser asking for a page is sent
 
-    Signed out, a page request gets 303 to ``login_path`` and anything else 401.
+    Signed out, a page request gets 303 to ``login_path`` and anything else 401. Optionally,
+
+        allows(user, method, path) -> bool   False answers 403 (for permissions the server
+                                             itself serves, such as ``/api/dirs``)
     """
 
     login_path: str
@@ -162,7 +165,13 @@ def make_handler(
             if auth is None:
                 return True
             _request.user = auth.user(self.headers)
-            if _request.user is not None or auth.public(method, path):
+            if _request.user is not None:
+                allows = getattr(auth, "allows", None)
+                if allows is not None and not allows(_request.user, method, path):
+                    self._json({"error": "you don't have permission for this"}, HTTPStatus.FORBIDDEN)
+                    return False
+                return True
+            if auth.public(method, path):
                 return True
             if method == "GET" and path in all_pages:
                 self._send(HTTPStatus.SEE_OTHER, b"", "text/plain", {"Location": auth.login_path})
