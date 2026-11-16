@@ -35,6 +35,15 @@ UI_HTML = (Path(__file__).parent / "ui.html").read_bytes()
 
 
 class API(Protocol):
+    """``state`` and ``post`` are required. An API may also define
+
+        get(action, query) -> (status, headers, body)
+
+    for ``GET <prefix><action>?...`` (``query`` holds the last value of each parameter;
+    ``headers`` must include ``Content-Type``). Without ``Cache-Control`` the response is
+    ``no-store``.
+    """
+
     def state(self) -> dict: ...
 
     def post(self, action: str, body: dict) -> tuple[int, dict]: ...
@@ -83,10 +92,12 @@ def make_handler(
     apis: dict[str, API],
     count_exts: Iterable[str] | None = None,
     allowed_origins: Iterable[str] = (),
+    pages: dict[str, bytes] | None = None,
 ):
     """``allowed_origins``: exact extra origins (such as ``chrome-extension://<id>``) whose POSTs are
     accepted besides the page's own. Browsers set ``Origin`` themselves, so pages and other
-    extensions can't claim one of these."""
+    extensions can't claim one of these. ``pages``: more HTML pages by path (``{"/library": ...}``)."""
+    all_pages = {"/": page, **(pages or {})}
     # Longest prefix first, so a more specific prefix ("/api/download/") wins over "/api/".
     routes = sorted(apis.items(), key=lambda kv: len(kv[0]), reverse=True)
     extra_origins = frozenset(allowed_origins)
@@ -97,13 +108,17 @@ def make_handler(
         def log_message(self, fmt, *args):  # keep the terminal quiet
             pass
 
-        def _send(self, status: int, body: bytes, ctype: str) -> None:
+        def _send(self, status: int, body: bytes, ctype: str, headers: dict | None = None) -> None:
+            headers = dict(headers or {})
             self.send_response(status)
             self.send_header("Content-Type", ctype)
             self.send_header("Content-Length", str(len(body)))
-            self.send_header("Cache-Control", "no-store")
+            self.send_header("Cache-Control", headers.pop("Cache-Control", "no-store"))
             self.send_header("X-Content-Type-Options", "nosniff")
-            self.send_header("X-Frame-Options", "DENY")
+            # Pages may frame each other (a tab showing another tool's page); other sites may not.
+            self.send_header("X-Frame-Options", "SAMEORIGIN")
+            for k, v in headers.items():
+                self.send_header(k, v)
             self.end_headers()
             self.wfile.write(body)
 
@@ -127,8 +142,8 @@ def make_handler(
             if not self._host_ok():
                 return self._send(HTTPStatus.FORBIDDEN, b"bad host", "text/plain")
             url = urlsplit(self.path)
-            if url.path == "/":
-                return self._send(200, page, "text/html; charset=utf-8")
+            if url.path in all_pages:
+                return self._send(200, all_pages[url.path], "text/html; charset=utf-8")
             if url.path == "/api/state":
                 state: dict = {}
                 for _, api in routes:
@@ -140,6 +155,16 @@ def make_handler(
                     return self._json(list_dirs(raw, count_exts))
                 except (OSError, ValueError) as e:
                     return self._json({"error": str(e)}, HTTPStatus.BAD_REQUEST)
+            for prefix, api in routes:
+                action = url.path[len(prefix) :]
+                if url.path.startswith(prefix) and "/" not in action and hasattr(api, "get"):
+                    query = {k: v[-1] for k, v in parse_qs(url.query).items()}
+                    try:
+                        status, headers, body = api.get(action, query)
+                    except (OSError, ValueError, KeyError, TypeError) as e:
+                        return self._json({"error": str(e)}, HTTPStatus.BAD_REQUEST)
+                    headers = dict(headers)
+                    return self._send(status, body, headers.pop("Content-Type"), headers)
             self._send(HTTPStatus.NOT_FOUND, b"not found", "text/plain")
 
         def do_POST(self):
@@ -175,8 +200,10 @@ def serve(
     apis: dict[str, API],
     count_exts: Iterable[str] | None = None,
     allowed_origins: Iterable[str] = (),
+    pages: dict[str, bytes] | None = None,
 ) -> ThreadingHTTPServer:
-    server = ThreadingHTTPServer(("127.0.0.1", port), make_handler(page, apis, count_exts, allowed_origins))
+    handler = make_handler(page, apis, count_exts, allowed_origins, pages)
+    server = ThreadingHTTPServer(("127.0.0.1", port), handler)
     server.daemon_threads = True
     return server
 

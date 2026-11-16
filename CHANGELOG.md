@@ -4,6 +4,10 @@ Each release has a `## <version>` section. The release pipeline publishes that s
 
 ## Unreleased
 
+## 0.3.0
+
+No change to downloading. This release keeps dl-queue's copy of the console server identical to cbz-webp 0.3.0, as harbor requires: APIs may answer `GET` requests, `serve` takes extra `pages`, and pages may be framed by the same origin (`SAMEORIGIN`).
+
 ## 0.2.0
 
 - Temporary failures are retried: timeouts, dropped connections, short reads, HTTP 5xx, 408 and 429. Backoff doubles from 1 s, honours `Retry-After` and is capped at a minute. `--retries` on `get` and `ui` and `DownloadQueue(retries=, backoff=)`; default 3. A job's `attempts` shows how many it took.
