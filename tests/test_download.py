@@ -1,11 +1,13 @@
 """Tests for the download queue, against a local HTTP server (never a real URL)."""
 
+import errno
 import json
 import tempfile
 import threading
 import time
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from helpers import FileServer
 
@@ -115,6 +117,50 @@ class DownloadTests(unittest.TestCase):
         job, _ = self.run_one("/files/x/a.bin")
         self.assertEqual(job.filename, "a (1).bin")
         self.assertEqual((self.dir / "a.bin").read_bytes(), b"mine")
+
+    def _file_appears_after_reserve(self, q, content=b"theirs"):
+        """Make a file appear at the reserved name while the download is running."""
+        reserve = q._reserve
+
+        def reserve_then_take(folder, name):
+            path = reserve(folder, name)
+            if not (folder / name).exists():  # first reservation only
+                (folder / name).write_bytes(content)
+            return path
+
+        q._reserve = reserve_then_take
+
+    def test_file_appearing_during_download_not_overwritten(self):
+        q = self.queue()
+        self._file_appears_after_reserve(q)
+        (job,), _ = q.add([self.server.base + "/files/x/a.bin"], self.dir)
+        q.wait_idle()
+        self.assertEqual(job.state, DONE, job.message)
+        self.assertEqual((self.dir / "a.bin").read_bytes(), b"theirs")
+        self.assertEqual(job.filename, "a (1).bin")
+        self.assertEqual(job.output, str(self.dir / "a (1).bin"))
+        self.assertEqual((self.dir / "a (1).bin").read_bytes(), b"data:a.bin")
+        self.assertEqual(self.files(), ["a (1).bin", "a.bin"])
+
+    def test_no_hard_links_still_never_overwrites(self):
+        q = self.queue()
+        self._file_appears_after_reserve(q)
+        with mock.patch("dlqueue.download.os.link", side_effect=OSError(errno.EPERM, "no links")) as link:
+            (job,), _ = q.add([self.server.base + "/files/x/a.bin"], self.dir)
+            q.wait_idle()
+        self.assertTrue(link.called)
+        self.assertEqual(job.state, DONE, job.message)
+        self.assertEqual((self.dir / "a.bin").read_bytes(), b"theirs")
+        self.assertEqual(job.filename, "a (1).bin")
+        self.assertEqual((self.dir / "a (1).bin").read_bytes(), b"data:a.bin")
+        self.assertEqual(self.files(), ["a (1).bin", "a.bin"])
+
+    def test_no_hard_links_saves_normally(self):
+        with mock.patch("dlqueue.download.os.link", side_effect=OSError(errno.EPERM, "no links")):
+            job, _ = self.run_one("/files/x/a.bin")
+        self.assertEqual(job.state, DONE, job.message)
+        self.assertEqual((self.dir / "a.bin").read_bytes(), b"data:a.bin")
+        self.assertEqual(self.files(), ["a.bin"])
 
     def test_concurrent_same_name_get_distinct_files(self):
         q = self.queue(workers=3)

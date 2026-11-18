@@ -272,7 +272,7 @@ class DownloadQueue(BaseQueue):
         return f"download-{job.id}"
 
     def _run(self, job: Download) -> None:
-        state: dict = {"path": None, "part": None, "validator": None}
+        state: dict = {"path": None, "part": None, "validator": None, "name": None}
         try:
             while True:
                 job.attempts += 1
@@ -352,7 +352,8 @@ class DownloadQueue(BaseQueue):
 
         with resp:
             if state["path"] is None:
-                path = self._reserve(Path(job.dest_dir), self._pick_name(job, resp))
+                state["name"] = self._pick_name(job, resp)
+                path = self._reserve(Path(job.dest_dir), state["name"])
                 state["path"] = path
                 state["part"] = part = path.with_name(path.name + PART_SUFFIX)
                 job.filename = path.name
@@ -381,4 +382,40 @@ class DownloadQueue(BaseQueue):
                 raise _Transient(f"connection dropped after {job.done} bytes: {e}") from e
         if job.total and job.done != job.total:
             raise _Transient(f"connection closed after {job.done} of {job.total} bytes")
-        os.replace(part, state["path"])
+        self._move_into_place(job, state)
+
+    def _move_into_place(self, job: Download, state: dict) -> None:
+        """Rename the finished ``.part`` to ``state["path"]`` without ever replacing an existing file.
+
+        ``_reserve`` checked the name, but a file can still appear there before the download ends.
+        If the name is taken by then, pick the next free one (``name (n).ext``) and try again.
+        """
+        while True:
+            path: Path = state["path"]
+            try:
+                self._place(state["part"], path)
+                return
+            except FileExistsError:  # taken since _reserve: move on to the next free name
+                new = self._reserve(path.parent, state["name"])
+                self._release(path)
+                state["path"] = new
+                job.filename = new.name
+
+    @staticmethod
+    def _place(part: Path, path: Path) -> None:
+        """Move ``part`` to ``path``; raise FileExistsError, never overwrite, if ``path`` exists."""
+        try:
+            os.link(part, path)
+        except FileExistsError:
+            raise
+        except OSError:
+            # No hard links here (drvfs /mnt/c, some network shares). Claim the name with an
+            # exclusive create, then replace only that empty placeholder, which is ours.
+            os.close(os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644))
+            try:
+                os.replace(part, path)
+            except BaseException:
+                path.unlink(missing_ok=True)
+                raise
+            return
+        part.unlink(missing_ok=True)
