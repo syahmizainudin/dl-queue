@@ -307,6 +307,13 @@ $("dlRows").onclick = async ev => {
 };
 
 /* ---------- rendering ---------- */
+// Assign innerHTML only when the markup changed, so unchanged rows aren't rebuilt every poll.
+const shownHTML = new Map();
+function setHTML(el, html) {
+  if (shownHTML.get(el) === html) return;
+  el.innerHTML = html;
+  shownHTML.set(el, html);
+}
 function counts(jobs) { const c = {}; for (const j of jobs) c[j.state] = (c[j.state] || 0) + 1; return c; }
 function chipsFor(c) {
   return ["queued","running","done","skipped","failed","cancelled"].filter(k => c[k]).map(k => `<span class="chip">${k} <b>${c[k]}</b></span>`);
@@ -324,10 +331,10 @@ function renderDownloads(st) {
   const chips = chipsFor(c);
   if (got) chips.push(`<span class="chip">downloaded <b>${fmt(got)}</b></span>`);
   chips.push(`<span class="chip">${st.download_workers} download(s) at a time${dlPaused ? " · <b>paused</b>" : ""}</span>`);
-  $("dlStats").innerHTML = chips.join("");
+  setHTML($("dlStats"), chips.join(""));
 
-  if (!jobs.length) { $("dlRows").innerHTML = `<tr><td colspan="5" class="empty">No downloads yet.</td></tr>`; return; }
-  $("dlRows").innerHTML = jobs.map(j => {
+  if (!jobs.length) { setHTML($("dlRows"), `<tr><td colspan="5" class="empty">No downloads yet.</td></tr>`); return; }
+  setHTML($("dlRows"), jobs.map(j => {
     let prog = "";
     if (j.state === "running") {
       prog = j.total
@@ -341,18 +348,31 @@ function renderDownloads(st) {
     return `<tr><td class="name">${esc(j.name)}<div class="dir">${esc(j.url)}</div><div class="dir">→ ${esc(j.dest_dir)}${auth}</div></td>
       <td><span class="state s-${j.state}">${j.state}</span>${prog}</td>
       <td class="size">${size}</td><td>${det}</td><td>${actionBtn(j)}</td></tr>`;
-  }).join("");
+  }).join(""));
 }
 
 function render(st) {
   renderDownloads(st);
 }
 
+/* ---------- polling ---------- */
+// One timer chain: every 1 s while the tab is visible, every 5 s while hidden. refresh() can be
+// called at any time (after an action); it never overlaps a request or starts a second chain.
+let pollTimer = null, polling = false, pollAgain = false;
 async function refresh() {
+  if (polling) { pollAgain = true; return; }  // fetch again once the current request ends
+  polling = true;
+  clearTimeout(pollTimer);
   try { render(await api("/api/state")); }
   catch (e) { say($("dlMsg"), "Lost connection to the server: " + e.message, true); }
+  finally {
+    polling = false;
+    if (pollAgain) { pollAgain = false; refresh(); }
+    else { clearTimeout(pollTimer); pollTimer = setTimeout(refresh, document.hidden ? 5000 : 1000); }
+  }
 }
-refresh(); setInterval(refresh, 1000);
+document.addEventListener("visibilitychange", () => { if (!document.hidden) refresh(); });
+refresh();
 </script>
 </body>
 </html>
