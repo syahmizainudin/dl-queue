@@ -292,18 +292,9 @@ class DownloadQueue(BaseQueue):
                     if job.cancel.wait(delay):
                         raise DownloadCancelled() from None
                     job.message = ""
-        except DownloadCancelled:
+        except (DownloadCancelled, DownloadError, OSError, ValueError) as e:
             self._discard(state)
-            return self._finish(job, CANCELLED, "cancelled; partial file removed")
-        except HTTPError as e:
-            self._discard(state)
-            return self._finish(job, FAILED, f"HTTP {e.code} {e.reason}")
-        except DownloadError as e:
-            self._discard(state)
-            return self._finish(job, FAILED, str(e))
-        except (OSError, ValueError) as e:
-            self._discard(state)
-            return self._finish(job, FAILED, f"{type(e).__name__}: {e}")
+            return self._finish(job, *self._failure(e))
         finally:
             if state["path"] is not None:
                 self._release(state["path"])
@@ -316,6 +307,17 @@ class DownloadQueue(BaseQueue):
                 self.on_saved(job, path)
             except Exception as e:  # noqa: BLE001 - the file is saved; report the hook's failure
                 job.message = f"saved; after-download step failed: {e}"
+
+    @staticmethod
+    def _failure(e: Exception) -> tuple[str, str]:
+        """The final state and message for an exception that ended a download."""
+        if isinstance(e, DownloadCancelled):
+            return CANCELLED, "cancelled; partial file removed"
+        if isinstance(e, HTTPError):  # before OSError: HTTPError is a subclass of it
+            return FAILED, f"HTTP {e.code} {e.reason}"
+        if isinstance(e, DownloadError):
+            return FAILED, str(e)
+        return FAILED, f"{type(e).__name__}: {e}"
 
     @staticmethod
     def _discard(state: dict) -> None:
