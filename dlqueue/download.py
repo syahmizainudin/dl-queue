@@ -148,11 +148,16 @@ class Download:
     started_at: float | None = None
     finished_at: float | None = None
     cancel: threading.Event = field(default_factory=threading.Event, repr=False)
+    # Display name until the file is named; the URL doesn't change, so work it out once.
+    _url_name: str = field(init=False, repr=False, compare=False, default="")
+
+    def __post_init__(self) -> None:
+        self._url_name = safe_name(urlsplit(self.url).path) or self.url
 
     def to_dict(self) -> dict:
-        d = {k: v for k, v in self.__dict__.items() if k not in ("auth", "cancel")}
+        d = {k: v for k, v in self.__dict__.items() if k not in ("auth", "cancel", "_url_name")}
         d["auth_mode"] = self.auth.mode  # the key itself is never exposed
-        d["name"] = self.filename or safe_name(urlsplit(self.url).path) or self.url
+        d["name"] = self.filename or self._url_name
         return d
 
     def fresh(self) -> Download:
