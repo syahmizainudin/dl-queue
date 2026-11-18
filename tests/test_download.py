@@ -243,6 +243,16 @@ class DownloadTests(unittest.TestCase):
         self.assertEqual((second.get("Range"), second.get("If-Range")), (f"bytes={half}-", '"v1"'))
         self.assertEqual(self.files(), ["big.bin"])
 
+    def test_resume_without_total_size(self):
+        # 206 with Content-Range "bytes N-M/*" and no Content-Length: the size comes from M.
+        q = self.queue(retries=2)
+        (job,), _ = q.add([self.server.base + "/resumestar/big.bin"], self.dir)
+        q.wait_idle()
+        self.assertEqual((job.state, job.attempts), (DONE, 2), job.message)
+        self.assertEqual(job.total, len(FileServer.RESUME_BODY))
+        self.assertEqual((self.dir / "big.bin").read_bytes(), FileServer.RESUME_BODY)
+        self.assertEqual(self.files(), ["big.bin"])
+
     def test_server_ignoring_range_restarts_cleanly(self):
         q = self.queue(retries=2)
         (job,), _ = q.add([self.server.base + "/noresume/big.bin"], self.dir)

@@ -358,10 +358,11 @@ class DownloadQueue(BaseQueue):
                 state["part"] = part = path.with_name(path.name + PART_SUFFIX)
                 job.filename = path.name
             length = int(resp.headers.get("Content-Length") or 0)
-            m = re.match(r"bytes (\d+)-\d+/(\d+|\*)", resp.headers.get("Content-Range", ""))
+            m = re.match(r"bytes (\d+)-(\d+)/(\d+|\*)", resp.headers.get("Content-Range", ""))
             if have and resp.status == 206 and m and int(m.group(1)) == have:
                 mode, job.done = "ab", have
-                job.total = int(m.group(2)) if m.group(2) != "*" else have + length
+                # Total size: the range's "/total", or its last byte + 1 when the total is "*".
+                job.total = int(m.group(3)) if m.group(3) != "*" else int(m.group(2)) + 1
             else:
                 mode, job.done, job.total = "wb", 0, length
                 etag = resp.headers.get("ETag", "")

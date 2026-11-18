@@ -24,6 +24,8 @@ class FileServer:
       /resume/<name>         RESUME_BODY with ETag "v1". First request: sends half, then closes.
                              Range + If-Range "v1" requests get a 206 with the rest
       /noresume/<name>       like /resume, but ignores Range and always sends the whole body (200)
+      /resumestar/<name>     like /resume, but the 206 has Content-Range "bytes N-M/*" (total
+                             unknown) and no Content-Length
       anything else          404
     """
 
@@ -79,15 +81,21 @@ class FileServer:
                     if parts[0] == "always500":
                         self.send_error(500, "Broken")
                         return None
-                    if parts[0] in ("resume", "noresume"):
+                    if parts[0] in ("resume", "noresume", "resumestar"):
                         body = outer.RESUME_BODY
                         rng = re.match(r"bytes=(\d+)-$", self.headers.get("Range", ""))
-                        if parts[0] == "resume" and rng and self.headers.get("If-Range") == '"v1"':
+                        resumes = parts[0] in ("resume", "resumestar")
+                        if resumes and rng and self.headers.get("If-Range") == '"v1"':
                             start = int(rng.group(1))
+                            star = parts[0] == "resumestar"
                             self.send_response(206)
                             self.send_header("ETag", '"v1"')
-                            self.send_header("Content-Range", f"bytes {start}-{len(body) - 1}/{len(body)}")
-                            self.send_header("Content-Length", str(len(body) - start))
+                            total = "*" if star else str(len(body))
+                            self.send_header("Content-Range", f"bytes {start}-{len(body) - 1}/{total}")
+                            if star:
+                                self.close_connection = True
+                            else:
+                                self.send_header("Content-Length", str(len(body) - start))
                             self.end_headers()
                             self.wfile.write(body[start:])
                             return None
