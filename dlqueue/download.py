@@ -193,6 +193,7 @@ class DownloadQueue(BaseQueue):
         self.retries = retries
         self.backoff = backoff
         self._reserved: set[Path] = set()
+        self._names = threading.Lock()  # guards _reserved; keeps filesystem checks off _cond
 
     # ------------------------------------------------------------ commands
     def add(
@@ -246,7 +247,7 @@ class DownloadQueue(BaseQueue):
         """Pick a free file name in ``folder`` and hold it until released."""
         p = PurePosixPath(name)
         stem, suffix = (p.stem, p.suffix) if p.suffix else (name, "")
-        with self._cond:
+        with self._names:  # the check and the add under one lock
             n = 0
             while True:
                 cand = folder / (name if n == 0 else f"{stem} ({n}){suffix}")
@@ -257,7 +258,7 @@ class DownloadQueue(BaseQueue):
                 n += 1
 
     def _release(self, path: Path) -> None:
-        with self._cond:
+        with self._names:
             self._reserved.discard(path)
 
     def _pick_name(self, job: Download, resp) -> str:
