@@ -97,9 +97,22 @@ class BaseQueue:
         return True
 
     def cancel_all(self) -> int:
+        """Cancel every queued and running job in one locked pass; emit once per job after."""
         with self._cond:
-            ids = [j.id for j in self._jobs.values() if j.state in ACTIVE]
-        return sum(self.cancel(i) for i in ids)
+            changed = []
+            for job in self._jobs.values():
+                if job.state == QUEUED:
+                    self._finish(job, CANCELLED, "cancelled before start")
+                elif job.state == RUNNING:
+                    job.cancel.set()
+                    job.message = "cancelling…"
+                else:
+                    continue
+                changed.append(job)
+            self._pending.clear()
+        for job in changed:
+            self._emit(job)
+        return len(changed)
 
     def retry(self, job_id: int) -> bool:
         with self._cond:
