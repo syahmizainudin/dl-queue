@@ -4,6 +4,8 @@ Each release has a `## <version>` section. The release pipeline publishes that s
 
 ## Unreleased
 
+## 0.4.2
+
 - A download never replaces a file that appears at its name while it runs. The finished file is moved with a hard link, or, where hard links aren't supported (such as `/mnt/c` in WSL), into a name claimed first with an exclusive create. If the name was taken, the file is saved as `name (1).ext` instead.
 - Resuming works with servers that send `Content-Range: bytes N-M/*` (total size unknown) and no `Content-Length`. Before, every such resume failed the length check.
 - The console page polls with one timer instead of `setInterval`: once a second while the tab is visible, every 5 seconds while it's hidden, and at once when it becomes visible again. Requests never overlap, and the table is redrawn only when something changed.
