@@ -22,7 +22,6 @@ def _fmt(n: float) -> str:
         if n < 1024 or unit == "GB":
             return f"{n:.0f} {unit}" if unit == "B" else f"{n:.1f} {unit}"
         n /= 1024
-    return str(n)
 
 
 def build_parser() -> argparse.ArgumentParser:
