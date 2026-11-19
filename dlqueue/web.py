@@ -81,6 +81,8 @@ def _byte_range(header: str | None, size: int) -> tuple[int, int] | None:
     if not header or not header.startswith("bytes=") or "," in header:
         return None
     first, _, last = header[6:].strip().partition("-")
+    if not (first or last) or not all(x.isdigit() for x in (first, last) if x):
+        return None  # malformed: ignored, the whole file is sent (RFC 9110)
     if not first:  # the last N bytes
         n = int(last)
         if n <= 0:

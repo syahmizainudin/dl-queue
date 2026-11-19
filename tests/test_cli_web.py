@@ -544,6 +544,8 @@ class ReachTests(TmpDir):
         self.assertEqual(
             self.req(port, "GET", "/api/x/file", {"Range": "bytes=0-1,4-5"})[0], 200
         )  # one range only
+        for junk in ("bytes=abc-", "bytes=-", "bytes=1-x", "items=0-1"):  # malformed: ignored
+            self.assertEqual(self.req(port, "GET", "/api/x/file", {"Range": junk})[0], 200, junk)
 
 
 if __name__ == "__main__":
