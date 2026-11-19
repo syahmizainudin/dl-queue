@@ -105,7 +105,7 @@
   <!-- ===================== Download ===================== -->
   <div id="pane-download">
     <section class="panel">
-      <label for="urls">File URLs (one per line)</label>
+      <label for="urls">File URLs (one per line; <span class="mono">{1..20}</span> in a URL makes one URL per number)</label>
       <textarea id="urls" placeholder="https://example.com/files/Chapter%2001.zip"></textarea>
 
       <div class="grid">
@@ -331,6 +331,8 @@ function renderDownloads(st) {
   const chips = chipsFor(c);
   if (got) chips.push(`<span class="chip">downloaded <b>${fmt(got)}</b></span>`);
   chips.push(`<span class="chip">${st.download_workers} download(s) at a time${dlPaused ? " · <b>paused</b>" : ""}</span>`);
+  if (st.download_rate) chips.push(`<span class="chip">limit <b>${fmt(st.download_rate)}/s</b></span>`);
+  if (st.download_hours) chips.push(`<span class="chip" title="New downloads start only in these hours">${st.download_waiting ? `<b>waiting until ${esc(st.download_hours.split("-")[0])}</b>` : `hours ${esc(st.download_hours)}`}</span>`);
   setHTML($("dlStats"), chips.join(""));
 
   if (!jobs.length) { setHTML($("dlRows"), `<tr><td colspan="5" class="empty">No downloads yet.</td></tr>`); return; }

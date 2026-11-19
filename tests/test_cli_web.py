@@ -197,7 +197,17 @@ class WebTests(TmpDir):
         status, page = self.request("GET", "/")
         self.assertEqual(status, 200)
         self.assertIn(b"<title>Download Queue</title>", page)
-        self.assertEqual(self.state(), {"downloads": [], "downloads_paused": False, "download_workers": 1})
+        self.assertEqual(
+            self.state(),
+            {
+                "downloads": [],
+                "downloads_paused": False,
+                "download_workers": 1,
+                "download_rate": 0,
+                "download_hours": None,
+                "download_waiting": False,
+            },
+        )
 
     def test_add_download_key_hidden(self):
         body = {

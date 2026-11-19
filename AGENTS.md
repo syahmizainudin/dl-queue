@@ -86,3 +86,9 @@ Both must pass before you hand work back. CI pins ruff (`RUFF_VERSION` in `ci.ym
 4. `git tag v<version> && git push origin v<version>`.
 
 `release.yml` then checks the tag against `__version__` and the CHANGELOG, runs the full CI, builds the sdist and wheel, and publishes a GitHub release with them, a `SHA256SUMS` file and the CHANGELOG section as notes. A tag with a `-` (`v0.2.0-rc1`) becomes a pre-release. harbor pins this repo by tag, so a release is how a change reaches it. Tagging and pushing tags publishes to GitHub, so do it only when the user asks for a release.
+
+## Speed limit, quiet hours, URL ranges
+
+- `DownloadQueue.limiter` (`RateLimiter`) is shared by every worker; `_attempt` takes from it after each chunk and treats a cancel while waiting as a cancel. `rate` 0 is no limit.
+- Quiet hours live in `DownloadQueue._next_runnable` and a `-clock` thread that wakes the workers every 30 s. `BaseQueue` is shared with cbz-webp, so never put them there.
+- `expand_ranges` (in `web.py`, outside the generic server part) runs on the API's and `get`'s URL lists before `add`, capped at `MAX_EXPANDED`.

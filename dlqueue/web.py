@@ -23,6 +23,7 @@ from __future__ import annotations
 import ipaddress
 import json
 import os
+import re
 import socket
 import ssl
 import string
@@ -456,6 +457,41 @@ def serve_downloads(port: int, queue: DownloadQueue) -> ThreadingHTTPServer:
 # ---------------------------------------------------------------- download API
 
 
+MAX_EXPANDED = 500
+RANGE_RE = re.compile(r"\{(\d+)\.\.(\d+)\}")
+
+
+def expand_ranges(urls: list[str], limit: int = MAX_EXPANDED) -> list[str]:
+    """``{1..20}`` in a URL becomes 20 URLs; ``{01..20}`` keeps the zero padding. One range per URL,
+    at most ``limit`` URLs in all (ValueError otherwise)."""
+    out: list[str] = []
+    for url in urls:
+        found = RANGE_RE.findall(url)
+        if len(found) > 1:
+            raise ValueError(f"only one {{a..b}} range per URL: {url}")
+        if not found:
+            out.append(url)
+        else:
+            a, b = found[0]
+            lo, hi = int(a), int(b)
+            if lo > hi:
+                raise ValueError(f"a range counts up, like {{1..20}}: {url}")
+            if hi - lo + 1 + len(out) > limit:
+                raise ValueError(f"that's more than {limit} URLs at once")
+            width = len(a) if a.startswith("0") and len(a) > 1 else 0
+            out += [RANGE_RE.sub(str(n).zfill(width), url, count=1) for n in range(lo, hi + 1)]
+        if len(out) > limit:
+            raise ValueError(f"that's more than {limit} URLs at once")
+    return out
+
+
+def format_hours(hours) -> str | None:
+    if hours is None:
+        return None
+    (h1, m1), (h2, m2) = divmod(hours[0], 60), divmod(hours[1], 60)
+    return f"{h1:02}:{m1:02}-{h2:02}:{m2:02}"
+
+
 class DownloadAPI:
     """The download queue's endpoints, mounted at ``/api/download/``."""
 
@@ -468,6 +504,9 @@ class DownloadAPI:
             "downloads": q.snapshot(),
             "downloads_paused": q.paused,
             "download_workers": q.workers,
+            "download_rate": q.rate,
+            "download_hours": format_hours(q.hours),
+            "download_waiting": q.waiting_for_hours(),
         }
 
     def post(self, action: str, body: dict) -> tuple[int, dict]:
@@ -483,7 +522,8 @@ class DownloadAPI:
             if not isinstance(after, dict):
                 raise ValueError("after must be an object")
             auth = Auth(str(a.get("mode", "none")), str(a.get("key", "")), str(a.get("name", "")))
-            added, dupes = q.add([str(u) for u in urls], str(body.get("dest", "")), auth, after=after)
+            urls = expand_ranges([str(u) for u in urls])
+            added, dupes = q.add(urls, str(body.get("dest", "")), auth, after=after)
             return 200, {"added": len(added), "duplicates": dupes}
         if action == "cancel":
             return 200, {"ok": q.cancel(int(body["id"]))}

@@ -406,5 +406,110 @@ class DownloadTests(unittest.TestCase):
         self.assertEqual(self.files(), [])
 
 
+class SpeedAndHoursTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.dir = Path(self.tmp.name)
+        self.server = FileServer({"big.bin": b"x" * 300_000})
+        self.q = None
+
+    def tearDown(self):
+        if self.q:
+            self.q.shutdown()
+        self.server.close()
+        self.tmp.cleanup()
+
+    def test_parsing(self):
+        from dlqueue.download import parse_hours, parse_size
+
+        self.assertEqual(
+            [parse_size(x) for x in ("0", "500", "500K", "5M", "1.5m", "2MB/s", "1G")],
+            [0, 500, 512000, 5242880, 1572864, 2097152, 1073741824],
+        )
+        for bad in ("fast", "-1", "5T", ""):
+            with self.assertRaises(ValueError):
+                parse_size(bad)
+        self.assertEqual(parse_hours("01:00-07:30"), (60, 450))
+        self.assertEqual(parse_hours("22:00-06:00"), (1320, 360))
+        self.assertEqual(parse_hours("00:00-24:00"), (0, 1440))
+        self.assertIsNone(parse_hours(""))
+        for bad in ("1-7", "25:00-01:00", "01:00-01:00", "10:61-11:00", "00:00-24:30"):
+            with self.assertRaises(ValueError):
+                parse_hours(bad)
+
+    def test_in_hours(self):
+        from dlqueue.download import in_hours
+
+        def at(h, m=0):
+            return time.mktime((2026, 11, 19, h, m, 0, 0, 0, -1))
+
+        self.assertTrue(in_hours(None, at(12)))
+        self.assertTrue(in_hours((60, 420), at(3)))
+        self.assertFalse(in_hours((60, 420), at(7)))
+        self.assertTrue(in_hours((1320, 360), at(23)))  # across midnight
+        self.assertTrue(in_hours((1320, 360), at(2)))
+        self.assertFalse(in_hours((1320, 360), at(12)))
+
+    def test_speed_limit(self):
+        self.q = DownloadQueue(workers=2, timeout=10, retries=0, rate=200_000).start()
+        start = time.monotonic()
+        self.q.add([self.server.base + "/files/a/big.bin", self.server.base + "/files/b/big.bin"], self.dir)
+        self.q.wait_idle()
+        took = time.monotonic() - start
+        self.assertEqual(sorted(j.state for j in self.q.jobs()), [DONE, DONE])
+        # 600 KB at 200 KB/s with up to a second saved up: at least ~2 s, both downloads sharing it
+        self.assertGreater(took, 1.8)
+        self.assertEqual((self.dir / "big.bin").stat().st_size, 300_000)
+
+    def test_cancel_while_waiting_for_the_limit(self):
+        self.q = DownloadQueue(workers=1, timeout=10, retries=0, rate=10_000).start()
+        (job,), _ = self.q.add([self.server.base + "/files/a/big.bin"], self.dir)
+        deadline = time.monotonic() + 5
+        while job.state != "running" and time.monotonic() < deadline:
+            time.sleep(0.02)
+        time.sleep(0.3)
+        self.q.cancel(job.id)
+        self.q.wait_idle()
+        self.assertEqual(job.state, CANCELLED)
+        self.assertEqual(list(self.dir.iterdir()), [])  # the .part is gone
+
+    def test_quiet_hours_hold_new_downloads(self):
+        now = time.localtime()
+        minute = now.tm_hour * 60 + now.tm_min
+        closed = ((minute + 60) % 1440, (minute + 120) % 1440)  # an hour from now, for an hour
+        self.q = DownloadQueue(workers=1, timeout=10, retries=0, hours=closed).start()
+        (job,), _ = self.q.add([self.server.base + "/files/a/x.bin"], self.dir)
+        time.sleep(0.5)
+        self.assertEqual(job.state, "queued")
+        self.assertTrue(self.q.waiting_for_hours())
+        self.q.hours = None  # the window opens: the clock wakes the workers within 30 s; poke now
+        with self.q._cond:
+            self.q._cond.notify_all()
+        self.q.wait_idle()
+        self.assertEqual(job.state, DONE)
+
+
+class RangeTests(unittest.TestCase):
+    def test_expand_ranges(self):
+        from dlqueue.web import expand_ranges
+
+        self.assertEqual(
+            expand_ranges(["http://x/c{1..3}.zip"]), ["http://x/c1.zip", "http://x/c2.zip", "http://x/c3.zip"]
+        )
+        self.assertEqual(
+            expand_ranges(["http://x/v{08..10}.cbz"]),
+            ["http://x/v08.cbz", "http://x/v09.cbz", "http://x/v10.cbz"],
+        )
+        self.assertEqual(expand_ranges(["http://x/a.zip"]), ["http://x/a.zip"])
+        for bad in (
+            ["http://x/{1..2}/{3..4}"],
+            ["http://x/{5..1}"],
+            ["http://x/{1..501}"],
+            ["http://x/{1..300}", "http://x/{1..300}"],
+        ):
+            with self.assertRaises(ValueError):
+                expand_ranges(bad)
+
+
 if __name__ == "__main__":
     unittest.main()

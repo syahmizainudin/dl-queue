@@ -37,6 +37,8 @@ Options for `get`:
 | `-j`, `--jobs` | 2 | Downloads at the same time |
 | `--timeout` | 60 | Seconds without data before an attempt fails |
 | `--retries` | 3 | Extra attempts after a temporary failure (see below). `0` turns retrying off |
+| `--rate` | none | Speed limit for all downloads together, such as `5M` or `500K` (bytes a second) |
+| `--hours` | always | Start downloads only between these local times, such as `01:00-07:00` (may cross midnight). A download already running finishes |
 
 There is no `--key` option on purpose: a key typed on the command line ends up in your shell history. Use the environment variable or the prompt.
 
@@ -48,7 +50,9 @@ dl-queue get https://api.example.com/files/1.zip https://api.example.com/files/2
 
 `get` exits with status 1 if any download failed, 2 for bad arguments, and 130 if you cancelled it with Ctrl+C. Windows paths such as `D:\Downloads` work in WSL and are read as `/mnt/d/Downloads`.
 
-`ui` takes `-d`, `--downloads` (default 2) for the number of downloads at the same time, and `--retries`.
+`ui` takes `-d`, `--downloads` (default 2) for the number of downloads at the same time, `--retries`, `--rate` and `--hours`.
+
+**URL ranges:** `{1..20}` in a URL stands for 20 URLs, one per number, and `{01..20}` keeps the zero padding (`01`, `02`, …). Each URL may have one range, and one add makes at most 500 URLs. This works in `get` and in the console.
 
 ## Web console
 

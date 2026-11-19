@@ -170,6 +170,68 @@ class Download:
         )
 
 
+def parse_size(text: str) -> int:
+    """Bytes per second from "0", "500K", "5M", "1.5M" or a plain number of bytes. 0 is no limit."""
+    m = re.fullmatch(r"\s*(\d+(?:\.\d+)?)\s*([KMG]?)(?:i?B)?(?:/s)?\s*", str(text), re.IGNORECASE)
+    if not m:
+        raise ValueError(f"a speed is a number with K, M or G, such as 5M: got {text!r}")
+    return int(float(m.group(1)) * {"": 1, "K": 1024, "M": 1024**2, "G": 1024**3}[m.group(2).upper()])
+
+
+def parse_hours(text: str) -> tuple[int, int] | None:
+    """(start, end) minutes after midnight from "01:00-07:00" (may cross midnight), or None for ""."""
+    if not str(text).strip():
+        return None
+    m = re.fullmatch(r"\s*(\d{1,2}):(\d{2})\s*-\s*(\d{1,2}):(\d{2})\s*", str(text))
+    if not m:
+        raise ValueError(f"hours look like 01:00-07:00: got {text!r}")
+    h1, m1, h2, m2 = (int(x) for x in m.groups())
+    if h1 > 23 or h2 > 24 or m1 > 59 or m2 > 59 or (h2 == 24 and m2):
+        raise ValueError(f"not a time of day in {text!r}")
+    start, end = h1 * 60 + m1, h2 * 60 + m2
+    if start == end:
+        raise ValueError("the hours start and end at the same time")
+    return start, end
+
+
+def in_hours(hours: tuple[int, int] | None, now: float | None = None) -> bool:
+    """Whether local time ``now`` is inside ``hours`` (always, without hours)."""
+    if hours is None:
+        return True
+    t = time.localtime(now)
+    minute = t.tm_hour * 60 + t.tm_min
+    start, end = hours
+    return start <= minute < end if start < end else minute >= start or minute < end % 1440
+
+
+class RateLimiter:
+    """One byte budget shared by every download: ``rate`` bytes a second (0: no limit), with up to a
+    second's worth saved up. ``take`` waits until the bytes may be used, or the job is cancelled."""
+
+    def __init__(self, rate: int = 0):
+        self.rate = int(rate)
+        self._lock = threading.Lock()
+        self._allowance = 0.0
+        self._at = time.monotonic()
+
+    def take(self, n: int, cancel: threading.Event) -> bool:
+        """False if ``cancel`` was set while waiting."""
+        while True:
+            rate = self.rate
+            if rate <= 0:
+                return True
+            with self._lock:
+                now = time.monotonic()
+                self._allowance = min(self._allowance + (now - self._at) * rate, rate)
+                self._at = now
+                if self._allowance >= n or self._allowance >= rate:  # a chunk bigger than a second's worth
+                    self._allowance -= n
+                    return True
+                wait = (min(n, rate) - self._allowance) / rate
+            if cancel.wait(min(wait, 1.0)):
+                return False
+
+
 class DownloadQueue(BaseQueue):
     thread_prefix = "download"
 
@@ -183,11 +245,17 @@ class DownloadQueue(BaseQueue):
         retries: int = 3,
         backoff: float = 1.0,
         on_change: Callable | None = None,
+        rate: int = 0,
+        hours: tuple[int, int] | None = None,
     ):
         """``check_after`` validates/normalizes ``after`` when jobs are added (raise ValueError).
 
         ``retries`` extra attempts follow a temporary failure, waiting ``backoff`` seconds, then
         twice that, and so on (or the server's ``Retry-After``), capped at a minute.
+
+        ``rate``: bytes a second for all downloads together (0: no limit; ``parse_size``).
+        ``hours``: (start, end) minutes after midnight (``parse_hours``): outside them no new
+        download starts, and running ones finish.
         """
         super().__init__(workers, on_change)
         if retries < 0 or backoff < 0:
@@ -199,6 +267,36 @@ class DownloadQueue(BaseQueue):
         self.backoff = backoff
         self._reserved: set[Path] = set()
         self._names = threading.Lock()  # guards _reserved; keeps filesystem checks off _cond
+        self.limiter = RateLimiter(rate)
+        self.hours = hours
+
+    @property
+    def rate(self) -> int:
+        return self.limiter.rate
+
+    def waiting_for_hours(self) -> bool:
+        """Whether queued downloads are held back because it's outside ``hours``."""
+        return not in_hours(self.hours)
+
+    def start(self):
+        super().start()
+        # Workers sleep until something changes; with hours, wake them when a window may open.
+        t = threading.Thread(target=self._clock, name=f"{self.thread_prefix}-clock", daemon=True)
+        t.start()
+        self._threads.append(t)
+        return self
+
+    def _clock(self) -> None:
+        with self._cond:
+            while not self._stopping:
+                self._cond.wait(30)
+                if self.hours is not None and self._pending:
+                    self._cond.notify_all()
+
+    def _next_runnable(self):
+        if not in_hours(self.hours):
+            return None
+        return super()._next_runnable()
 
     # ------------------------------------------------------------ commands
     def add(
@@ -383,7 +481,7 @@ class DownloadQueue(BaseQueue):
                         chunk = resp.read(CHUNK)
                         if not chunk:
                             break
-                        if job.cancel.is_set():
+                        if job.cancel.is_set() or not self.limiter.take(len(chunk), job.cancel):
                             raise DownloadCancelled()
                         f.write(chunk)
                         job.done += len(chunk)

@@ -12,7 +12,8 @@ import webbrowser
 
 from . import __version__
 from .basequeue import CANCELLED, DONE, FAILED, RUNNING
-from .download import AUTH_MODES, Auth, Download, DownloadQueue
+from .download import AUTH_MODES, Auth, Download, DownloadQueue, parse_hours, parse_size
+from .web import expand_ranges
 
 DEFAULT_KEY_ENV = "DL_QUEUE_KEY"
 
@@ -64,6 +65,15 @@ def build_parser() -> argparse.ArgumentParser:
         "--retries", type=int, default=3, help="extra attempts after a temporary failure (default 3)"
     )
     u.add_argument("--open", action="store_true", help="open the console in a browser")
+    for p in (g, u):
+        p.add_argument(
+            "--rate",
+            default="0",
+            help="speed limit for all downloads together, such as 5M or 500K (default none)",
+        )
+        p.add_argument(
+            "--hours", default="", help="start downloads only between these times, such as 01:00-07:00"
+        )
     return ap
 
 
@@ -90,7 +100,8 @@ def _key(args) -> str:
 
 def cmd_get(args) -> int:
     try:
-        urls = _read_urls(args)
+        urls = expand_ranges(_read_urls(args))
+        rate, hours = parse_size(args.rate), parse_hours(args.hours)
         if args.jobs < 1:
             raise ValueError("--jobs must be at least 1")
         if args.retries < 0:
@@ -118,7 +129,14 @@ def cmd_get(args) -> int:
                 where = f" -> {job.output} ({_fmt(job.done)})" if job.state == DONE else ""
                 print(f"[{tag} {finished[0]}/{total[0]}] {job.url}{where} {job.message}", flush=True)
 
-    q = DownloadQueue(workers=args.jobs, timeout=args.timeout, retries=args.retries, on_change=on_change)
+    q = DownloadQueue(
+        workers=args.jobs,
+        timeout=args.timeout,
+        retries=args.retries,
+        on_change=on_change,
+        rate=rate,
+        hours=hours,
+    )
     q.set_paused(True)  # queue everything first, so the progress count is right
     q.start()
     try:
@@ -159,7 +177,12 @@ def cmd_ui(args) -> int:
     if args.downloads < 1 or args.retries < 0:
         print("dl-queue: --downloads must be at least 1 and --retries not negative", file=sys.stderr)
         return 2
-    q = DownloadQueue(workers=args.downloads, retries=args.retries).start()
+    try:
+        rate, hours = parse_size(args.rate), parse_hours(args.hours)
+    except ValueError as e:
+        print(f"dl-queue: {e}", file=sys.stderr)
+        return 2
+    q = DownloadQueue(workers=args.downloads, retries=args.retries, rate=rate, hours=hours).start()
     try:
         server = serve_downloads(args.port, q)
     except OSError as e:

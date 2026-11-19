@@ -4,6 +4,11 @@ Each release has a `## <version>` section. The release pipeline publishes that s
 
 ## Unreleased
 
+- **Speed limit:** `--rate 5M` (or `DownloadQueue(rate=)`) shares one byte budget between all downloads. Cancelling still works while a download waits for its share.
+- **Quiet hours:** `--hours 01:00-07:00` (or `DownloadQueue(hours=)`, see `parse_hours`): outside them no new download starts; running ones finish. The console shows "waiting until 01:00".
+- **URL ranges:** `{1..20}` and `{01..20}` in a URL expand to one URL per number, in `get` and the console's add (at most 500 per add).
+- `/api/state` adds `download_rate`, `download_hours` and `download_waiting`.
+
 ## 0.5.0
 
 - **For hosts (harbor): reaching the console from other devices.** `serve()` takes `host` (bind address), `allowed_hosts` (host names accepted besides 127.0.0.1 and localhost), `ssl_context` (HTTPS; the TLS handshake runs in the request's thread) and `trust_proxy` (a reverse proxy on this machine may pass `X-Forwarded-Proto`, `-Host` and `-For`). The Origin check follows the scheme and host actually used. Without them nothing changes: the console stays on 127.0.0.1.
