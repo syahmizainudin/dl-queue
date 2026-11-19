@@ -4,6 +4,10 @@ Each release has a `## <version>` section. The release pipeline publishes that s
 
 ## Unreleased
 
+- **For hosts (harbor): reaching the console from other devices.** `serve()` takes `host` (bind address), `allowed_hosts` (host names accepted besides 127.0.0.1 and localhost), `ssl_context` (HTTPS; the TLS handshake runs in the request's thread) and `trust_proxy` (a reverse proxy on this machine may pass `X-Forwarded-Proto`, `-Host` and `-For`). The Origin check follows the scheme and host actually used. Without them nothing changes: the console stays on 127.0.0.1.
+- `current_client()` names the client's address. An API's `get` may return `FileBody(path)` to stream a file in chunks, with single `Range` requests answered 206.
+- A request that stops sending is dropped after 120 s, and handshake errors and dropped connections are no longer printed.
+
 ## 0.4.2
 
 - A download never replaces a file that appears at its name while it runs. The finished file is moved with a hard link, or, where hard links aren't supported (such as `/mnt/c` in WSL), into a name claimed first with an exclusive create. If the name was taken, the file is saved as `name (1).ext` instead.

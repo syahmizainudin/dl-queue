@@ -5,6 +5,9 @@ import http.client
 import io
 import json
 import os
+import shutil
+import ssl
+import subprocess
 import tempfile
 import threading
 import unittest
@@ -17,7 +20,7 @@ from helpers import FileServer
 from dlqueue import __version__, cli
 from dlqueue.basequeue import CANCELLED, DONE, FAILED
 from dlqueue.download import DownloadQueue
-from dlqueue.web import current_user, serve, serve_downloads
+from dlqueue.web import FileBody, current_client, current_user, serve, serve_downloads
 
 KEY = FileServer.KEY
 
@@ -385,6 +388,162 @@ class AuthServerTests(TmpDir):
 
     def test_without_auth_there_is_no_user(self):
         self.assertIsNone(current_user())
+
+
+class ReachTests(TmpDir):
+    """Allowed host names, HTTPS, a trusted reverse proxy, the client address, and file bodies."""
+
+    class API:
+        def __init__(self, path):
+            self.path = path
+
+        def state(self):
+            return {"client": current_client()}
+
+        def post(self, action, body):
+            return 200, {"client": current_client()}
+
+        def get(self, action, query):
+            if action == "file":
+                return 200, {"Content-Type": "application/octet-stream"}, FileBody(self.path)
+            return 404, {"Content-Type": "application/json"}, b"{}"
+
+    def start(self, **kw):
+        self.blob = self.dir / "blob.bin"
+        self.data = os.urandom(700_000)
+        self.blob.write_bytes(self.data)
+        server = serve(0, b"<title>p</title>", {"/api/x/": self.API(self.blob)}, **kw)
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        return server.server_address[1]
+
+    def req(self, port, method, path, headers=None, body=None, context=None):
+        if context is not None:
+            conn = http.client.HTTPSConnection("127.0.0.1", port, timeout=10, context=context)
+        else:
+            conn = http.client.HTTPConnection("127.0.0.1", port, timeout=10)
+        conn.putrequest(method, path, skip_host=True)
+        h = {"Host": f"127.0.0.1:{port}", **(headers or {})}
+        data = json.dumps(body).encode() if body is not None else b""
+        if body is not None:
+            h["Content-Type"] = "application/json"
+            h["Content-Length"] = str(len(data))
+        for k, v in h.items():
+            conn.putheader(k, v)
+        conn.endheaders(data or None)
+        resp = conn.getresponse()
+        raw, rh = resp.read(), dict(resp.getheaders())
+        conn.close()
+        return resp.status, rh, raw
+
+    def test_allowed_host_names(self):
+        port = self.start(allowed_hosts=["harbor.lan", "192.168.1.5"])
+        for host in (
+            "harbor.lan",
+            f"harbor.lan:{port}",
+            "HARBOR.LAN:443",
+            f"192.168.1.5:{port}",
+            f"localhost:{port}",
+        ):
+            self.assertEqual(self.req(port, "GET", "/", {"Host": host})[0], 200, host)
+        for host in ("evil.example", f"harbor.lan.evil.example:{port}", "", f"127.0.0.1:{port + 1}"):
+            self.assertEqual(self.req(port, "GET", "/", {"Host": host})[0], 403, host)
+        ok = {"Host": "harbor.lan:8765", "Origin": "http://harbor.lan:8765"}
+        self.assertEqual(self.req(port, "POST", "/api/x/a", ok, {})[0], 200)
+        bad = {"Host": "harbor.lan:8765", "Origin": "http://evil.example"}
+        self.assertEqual(self.req(port, "POST", "/api/x/a", bad, {})[0], 403)
+        # without allowed_hosts nothing changes
+        port2 = self.start()
+        self.assertEqual(self.req(port2, "GET", "/", {"Host": "harbor.lan"})[0], 403)
+
+    def test_https(self):
+        if not shutil.which("openssl"):
+            self.skipTest("needs openssl to make a certificate")
+        cert, key = self.dir / "c.pem", self.dir / "k.pem"
+        subprocess.run(
+            [
+                "openssl",
+                "req",
+                "-x509",
+                "-newkey",
+                "rsa:2048",
+                "-nodes",
+                "-days",
+                "1",
+                "-subj",
+                "/CN=127.0.0.1",
+                "-keyout",
+                str(key),
+                "-out",
+                str(cert),
+            ],
+            check=True,
+            capture_output=True,
+        )
+        ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        ctx.load_cert_chain(cert, key)
+        port = self.start(ssl_context=ctx)
+        client = ssl.create_default_context(cafile=str(cert))
+        client.check_hostname = False
+        self.assertEqual(self.req(port, "GET", "/", context=client)[0], 200)
+        same = {"Origin": f"https://127.0.0.1:{port}"}
+        self.assertEqual(self.req(port, "POST", "/api/x/a", same, {}, context=client)[0], 200)
+        plain = {"Origin": f"http://127.0.0.1:{port}"}  # wrong scheme: not this page
+        self.assertEqual(self.req(port, "POST", "/api/x/a", plain, {}, context=client)[0], 403)
+        # a plain-HTTP client gets no page; the server carries on
+        with self.assertRaises((http.client.HTTPException, ConnectionError, OSError)):
+            self.req(port, "GET", "/")
+        self.assertEqual(self.req(port, "GET", "/", context=client)[0], 200)
+
+    def test_trusted_proxy(self):
+        port = self.start(allowed_hosts=["books.example"], trust_proxy=True)
+        fwd = {
+            "X-Forwarded-Proto": "https",
+            "X-Forwarded-Host": "books.example",
+            "X-Forwarded-For": "203.0.113.9, 10.0.0.1",
+        }
+        status, _, raw = self.req(port, "POST", "/api/x/a", {**fwd, "Origin": "https://books.example"}, {})
+        self.assertEqual((status, json.loads(raw)), (200, {"client": "203.0.113.9"}))
+        self.assertEqual(
+            self.req(port, "POST", "/api/x/a", {**fwd, "Origin": "http://books.example"}, {})[0], 403
+        )
+        self.assertEqual(self.req(port, "GET", "/", {**fwd, "X-Forwarded-Host": "evil.example"})[0], 403)
+        junk = {**fwd, "X-Forwarded-For": "not an address"}
+        self.assertEqual(
+            json.loads(
+                self.req(port, "POST", "/api/x/a", {**junk, "Origin": "https://books.example"}, {})[2]
+            ),
+            {"client": "127.0.0.1"},
+        )
+        # not trusted: the forwarded headers mean nothing
+        port2 = self.start(allowed_hosts=["books.example"])
+        self.assertEqual(
+            self.req(port2, "POST", "/api/x/a", {**fwd, "Origin": "https://books.example"}, {})[0], 403
+        )
+        status, _, raw = self.req(port2, "POST", "/api/x/a", {"X-Forwarded-For": "203.0.113.9"}, {})
+        self.assertEqual(json.loads(raw), {"client": "127.0.0.1"})
+
+    def test_file_body_and_ranges(self):
+        port = self.start()
+        status, h, raw = self.req(port, "GET", "/api/x/file")
+        self.assertEqual(
+            (status, raw == self.data, h["Content-Length"], h["Accept-Ranges"]),
+            (200, True, str(len(self.data)), "bytes"),
+        )
+        status, h, raw = self.req(port, "GET", "/api/x/file", {"Range": "bytes=10-19"})
+        self.assertEqual(
+            (status, raw, h["Content-Range"]), (206, self.data[10:20], f"bytes 10-19/{len(self.data)}")
+        )
+        status, _, raw = self.req(port, "GET", "/api/x/file", {"Range": "bytes=-5"})
+        self.assertEqual((status, raw), (206, self.data[-5:]))
+        status, _, raw = self.req(port, "GET", "/api/x/file", {"Range": "bytes=699990-"})
+        self.assertEqual((status, raw), (206, self.data[699990:]))
+        status, h, _ = self.req(port, "GET", "/api/x/file", {"Range": f"bytes={len(self.data)}-"})
+        self.assertEqual((status, h["Content-Range"]), (416, f"bytes */{len(self.data)}"))
+        self.assertEqual(
+            self.req(port, "GET", "/api/x/file", {"Range": "bytes=0-1,4-5"})[0], 200
+        )  # one range only
 
 
 if __name__ == "__main__":

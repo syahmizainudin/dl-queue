@@ -11,14 +11,22 @@ The server adds the request guards, ``GET /api/dirs`` for the folder picker, and
 ``ValueError``/``OSError``/``KeyError`` from an API into a 400. With ``auth``, every request
 except the ones ``auth`` makes public needs a signed-in user, and ``current_user()`` names it.
 
+By default it listens on 127.0.0.1 only. A host can bind another address with ``host``, name the
+host names it may be reached by (``allowed_hosts``), serve HTTPS (``ssl_context``), or sit behind
+a reverse proxy on the same machine (``trust_proxy``); deciding when that is safe is the host's job.
+
 cbz-webp has an identical copy of the generic part; keep the two in step.
 """
 
 from __future__ import annotations
 
+import ipaddress
 import json
 import os
+import socket
+import ssl
 import string
+import sys
 import threading
 from collections.abc import Iterable
 from http import HTTPStatus
@@ -44,6 +52,44 @@ def current_user():
     """The signed-in user of the request being handled, as ``auth.user`` returned it.
     None without ``auth``, or for a public request from someone signed out."""
     return getattr(_request, "user", None)
+
+
+def current_client() -> str:
+    """The address of the client that sent the request being handled: the connection's, or with
+    ``trust_proxy`` and a connection from this machine, the first ``X-Forwarded-For`` address."""
+    return getattr(_request, "client", "")
+
+
+LOOPBACK = frozenset({"127.0.0.1", "::1", "::ffff:127.0.0.1"})
+CHUNK = 256 * 1024
+
+
+class FileBody:
+    """A file an API's ``get`` returns as the body, instead of bytes: the server streams it in
+    chunks and answers a single ``Range: bytes=`` request with 206. The API finds the path itself
+    (by id); it never comes from the request."""
+
+    def __init__(self, path, filename: str | None = None):
+        self.path = Path(path)
+        self.size = self.path.stat().st_size
+        self.filename = filename
+
+
+def _byte_range(header: str | None, size: int) -> tuple[int, int] | None:
+    """(first, last) for a single ``bytes=`` range, None for the whole file. ValueError if it
+    can't be satisfied."""
+    if not header or not header.startswith("bytes=") or "," in header:
+        return None
+    first, _, last = header[6:].strip().partition("-")
+    if not first:  # the last N bytes
+        n = int(last)
+        if n <= 0:
+            raise ValueError("bad range")
+        return max(size - n, 0), size - 1
+    a, b = int(first), (int(last) if last else size - 1)
+    if a >= size or b < a:
+        raise ValueError("bad range")
+    return a, min(b, size - 1)
 
 
 class SignIn(Protocol):
@@ -127,20 +173,60 @@ def make_handler(
     allowed_origins: Iterable[str] = (),
     pages: dict[str, bytes] | None = None,
     auth: SignIn | None = None,
+    allowed_hosts: Iterable[str] = (),
+    https: bool = False,
+    trust_proxy: bool = False,
 ):
     """``allowed_origins``: exact extra origins (such as ``chrome-extension://<id>``) whose POSTs are
     accepted besides the page's own. Browsers set ``Origin`` themselves, so pages and other
-    extensions can't claim one of these. ``pages``: more HTML pages by path (``{"/library": ...}``)."""
+    extensions can't claim one of these. ``pages``: more HTML pages by path (``{"/library": ...}``).
+
+    ``allowed_hosts``: host names (no port) the server may be reached by, besides 127.0.0.1 and
+    localhost on its own port. ``https``: the socket is TLS. ``trust_proxy``: a request from this
+    machine may say, in ``X-Forwarded-Proto``/``-Host``/``-For``, how the client reached the proxy."""
     all_pages = {"/": page, **(pages or {})}
     # Longest prefix first, so a more specific prefix ("/api/download/") wins over "/api/".
     routes = sorted(apis.items(), key=lambda kv: len(kv[0]), reverse=True)
     extra_origins = frozenset(allowed_origins)
+    names = frozenset(h.strip().lower().rstrip(".") for h in allowed_hosts if h.strip())
 
     class Handler(BaseHTTPRequestHandler):
         server_version = "local-console"
+        timeout = 120  # a client that stops sending doesn't hold a thread for ever
 
         def log_message(self, fmt, *args):  # keep the terminal quiet
             pass
+
+        def setup(self):
+            if isinstance(self.request, ssl.SSLSocket):  # the handshake runs here, not in accept()
+                self.request.settimeout(15)
+                self.request.do_handshake()
+            super().setup()
+
+        def _proxied(self) -> bool:
+            return trust_proxy and self.client_address[0] in LOOPBACK
+
+        def _scheme(self) -> str:
+            if self._proxied():
+                proto = self.headers.get("X-Forwarded-Proto", "").split(",")[0].strip().lower()
+                if proto in ("http", "https"):
+                    return proto
+            return "https" if https else "http"
+
+        def _host(self) -> str:
+            """The host the client asked for: ``Host``, or a trusted proxy's ``X-Forwarded-Host``."""
+            if self._proxied() and self.headers.get("X-Forwarded-Host"):
+                return self.headers["X-Forwarded-Host"].split(",")[0].strip()
+            return self.headers.get("Host", "")
+
+        def _client(self) -> str:
+            if self._proxied() and self.headers.get("X-Forwarded-For"):
+                first = self.headers["X-Forwarded-For"].split(",")[0].strip()
+                try:
+                    return str(ipaddress.ip_address(first))
+                except ValueError:
+                    pass
+            return self.client_address[0]
 
         def _send(self, status: int, body: bytes, ctype: str, headers: dict | None = None) -> None:
             headers = dict(headers or {})
@@ -180,8 +266,14 @@ def make_handler(
             return False
 
         def _host_ok(self) -> bool:
-            port = self.server.server_address[1]
-            return self.headers.get("Host", "") in (f"127.0.0.1:{port}", f"localhost:{port}")
+            host, port = self._host(), self.server.server_address[1]
+            if host in (f"127.0.0.1:{port}", f"localhost:{port}"):
+                return True
+            try:
+                name = urlsplit("//" + host).hostname or ""
+            except ValueError:
+                return False
+            return name.rstrip(".") in names
 
         def _origin_ok(self) -> bool:
             origin = self.headers.get("Origin")
@@ -189,17 +281,54 @@ def make_handler(
                 return True
             if origin in extra_origins:
                 return True
-            return urlsplit(origin).scheme == "http" and urlsplit(origin).netloc == self.headers.get("Host")
+            return urlsplit(origin).scheme == self._scheme() and urlsplit(origin).netloc == self._host()
+
+        def _send_file(self, status: int, body: FileBody, ctype: str, headers: dict) -> None:
+            """Stream a file, or the one byte range asked for (206)."""
+            try:
+                span = _byte_range(self.headers.get("Range"), body.size)
+            except ValueError:
+                return self._send(
+                    HTTPStatus.REQUESTED_RANGE_NOT_SATISFIABLE,
+                    b"",
+                    "text/plain",
+                    {"Content-Range": f"bytes */{body.size}"},
+                )
+            first, last = span or (0, body.size - 1)
+            length = max(last - first + 1, 0)
+            self.send_response(HTTPStatus.PARTIAL_CONTENT if span else status)
+            self.send_header("Content-Type", ctype)
+            self.send_header("Content-Length", str(length))
+            self.send_header("Accept-Ranges", "bytes")
+            if span:
+                self.send_header("Content-Range", f"bytes {first}-{last}/{body.size}")
+            self.send_header("Cache-Control", headers.pop("Cache-Control", "no-store"))
+            self.send_header("X-Content-Type-Options", "nosniff")
+            self.send_header("X-Frame-Options", "SAMEORIGIN")
+            for k, v in headers.items():
+                self.send_header(k, v)
+            self.end_headers()
+            with open(body.path, "rb") as f:
+                f.seek(first)
+                left = length
+                while left > 0:
+                    chunk = f.read(min(CHUNK, left))
+                    if not chunk:
+                        break
+                    self.wfile.write(chunk)
+                    left -= len(chunk)
 
         def do_GET(self):
             # Checking Host also stops DNS rebinding from reading the API.
             if not self._host_ok():
                 return self._send(HTTPStatus.FORBIDDEN, b"bad host", "text/plain")
+            _request.client = self._client()
             try:
                 if self._signed_in("GET", urlsplit(self.path).path):
                     self._get()
             finally:
                 _request.user = None
+                _request.client = ""
 
         def _get(self):
             url = urlsplit(self.path)
@@ -225,6 +354,8 @@ def make_handler(
                     except (OSError, ValueError, KeyError, TypeError) as e:
                         return self._json({"error": str(e)}, HTTPStatus.BAD_REQUEST)
                     headers = dict(headers)
+                    if isinstance(body, FileBody):
+                        return self._send_file(status, body, headers.pop("Content-Type"), headers)
                     return self._send(status, body, headers.pop("Content-Type"), headers)
             self._send(HTTPStatus.NOT_FOUND, b"not found", "text/plain")
 
@@ -234,11 +365,13 @@ def make_handler(
                 return self._json({"error": "forbidden"}, HTTPStatus.FORBIDDEN)
             if self.headers.get("Content-Type", "").split(";")[0].strip() != "application/json":
                 return self._json({"error": "JSON only"}, HTTPStatus.UNSUPPORTED_MEDIA_TYPE)
+            _request.client = self._client()
             try:
                 if self._signed_in("POST", urlsplit(self.path).path):
                     self._post()
             finally:
                 _request.user = None
+                _request.client = ""
 
         def _post(self):
             try:
@@ -262,6 +395,20 @@ def make_handler(
     return Handler
 
 
+class _Server(ThreadingHTTPServer):
+    daemon_threads = True
+
+    def handle_error(self, request, client_address):
+        # A client that isn't speaking TLS, or hangs up or stalls, isn't worth a traceback.
+        if isinstance(sys.exc_info()[1], (ssl.SSLError, ConnectionError, TimeoutError)):
+            return
+        super().handle_error(request, client_address)
+
+
+class _Server6(_Server):
+    address_family = socket.AF_INET6
+
+
 def serve(
     port: int,
     page: bytes,
@@ -270,10 +417,29 @@ def serve(
     allowed_origins: Iterable[str] = (),
     pages: dict[str, bytes] | None = None,
     auth: SignIn | None = None,
+    *,
+    host: str = "127.0.0.1",
+    allowed_hosts: Iterable[str] = (),
+    ssl_context: ssl.SSLContext | None = None,
+    trust_proxy: bool = False,
 ) -> ThreadingHTTPServer:
-    handler = make_handler(page, apis, count_exts, allowed_origins, pages, auth)
-    server = ThreadingHTTPServer(("127.0.0.1", port), handler)
-    server.daemon_threads = True
+    """The console server on ``host:port`` (127.0.0.1 unless the host asks otherwise)."""
+    handler = make_handler(
+        page,
+        apis,
+        count_exts,
+        allowed_origins,
+        pages,
+        auth,
+        allowed_hosts=allowed_hosts,
+        https=ssl_context is not None,
+        trust_proxy=trust_proxy,
+    )
+    server = (_Server6 if ":" in host else _Server)((host, port), handler)
+    if ssl_context is not None:
+        server.socket = ssl_context.wrap_socket(
+            server.socket, server_side=True, do_handshake_on_connect=False
+        )
     return server
 
 
