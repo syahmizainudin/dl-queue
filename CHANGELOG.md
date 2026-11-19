@@ -4,6 +4,8 @@ Each release has a `## <version>` section. The release pipeline publishes that s
 
 ## Unreleased
 
+## 0.5.1
+
 - **Speed limit:** `--rate 5M` (or `DownloadQueue(rate=)`) shares one byte budget between all downloads. Cancelling still works while a download waits for its share.
 - **Quiet hours:** `--hours 01:00-07:00` (or `DownloadQueue(hours=)`, see `parse_hours`): outside them no new download starts; running ones finish. The console shows "waiting until 01:00".
 - **URL ranges:** `{1..20}` and `{01..20}` in a URL expand to one URL per number, in `get` and the console's add (at most 500 per add).
