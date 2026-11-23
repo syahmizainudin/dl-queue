@@ -92,7 +92,9 @@ q.wait_idle()
 q.shutdown()
 ```
 
-**Lanes** give groups of downloads their own limits: `DownloadQueue(lanes=[Lane("manga", workers=2, rate=parse_size("5M"), hours=parse_hours("01:00-07:00"))])`, or `q.set_lanes([...])` while it runs, and `q.add(urls, folder, lane="manga")`. A lane runs `workers` of its downloads at once, its `rate` caps the lane (the queue's `rate` still caps everything), and a lane without `hours` follows the queue's. Downloads with no lane, or whose lane was removed, run in the default lane: the queue's own `workers` and `hours`. Lanes are for programs that host the queue (such as harbor); the command line doesn't set them.
+**Lanes** give groups of downloads their own limits: `DownloadQueue(lanes=[Lane("manga", workers=2, rate=parse_size("5M"), hours=parse_hours("01:00-07:00"))])`, or `q.set_lanes([...])` while it runs, and `q.add(urls, folder, lane="manga")`. A lane runs `workers` of its downloads at once, its `rate` caps the lane (the queue's `rate` still caps everything), and a lane without `hours` follows the queue's. Downloads with no lane, or whose lane was removed, run in the default lane: the queue's own `workers` and `hours`. `q.set_lane_paused("manga", True)` holds one lane's queued downloads (running ones finish); the console API's `lane-pause` action does the same. Lanes are for programs that host the queue (such as harbor); the command line doesn't set them.
+
+**Taking turns between sites:** `--fair` (or `DownloadQueue(fair=True)`) starts the next download from the site with the fewest downloads running in its lane, instead of first queued, first started. Queue 50 links from one site and 5 from another, and with 2 at once one of each runs.
 
 `dlqueue.web.serve(port, page, apis)` and `DownloadAPI` let another tool put the download queue on its own page. [cbz-webp](https://github.com/syahmizainudin/cbz-webp) converts the downloaded archives to WebP.
 

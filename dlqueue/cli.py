@@ -74,6 +74,11 @@ def build_parser() -> argparse.ArgumentParser:
         p.add_argument(
             "--hours", default="", help="start downloads only between these times, such as 01:00-07:00"
         )
+        p.add_argument(
+            "--fair",
+            action="store_true",
+            help="take turns between sites: start the next download from the site with the fewest running",
+        )
     return ap
 
 
@@ -136,6 +141,7 @@ def cmd_get(args) -> int:
         on_change=on_change,
         rate=rate,
         hours=hours,
+        fair=args.fair,
     )
     q.set_paused(True)  # queue everything first, so the progress count is right
     q.start()
@@ -182,7 +188,9 @@ def cmd_ui(args) -> int:
     except ValueError as e:
         print(f"dl-queue: {e}", file=sys.stderr)
         return 2
-    q = DownloadQueue(workers=args.downloads, retries=args.retries, rate=rate, hours=hours).start()
+    q = DownloadQueue(
+        workers=args.downloads, retries=args.retries, rate=rate, hours=hours, fair=args.fair
+    ).start()
     try:
         server = serve_downloads(args.port, q)
     except OSError as e:

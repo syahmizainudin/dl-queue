@@ -522,6 +522,56 @@ class LaneTests(unittest.TestCase):
         minute = now.tm_hour * 60 + now.tm_min
         return ((minute + 60) % 1440, (minute + 120) % 1440)  # an hour from now, for an hour
 
+    def test_paused_lane_holds_its_downloads(self):
+        self.q = DownloadQueue(workers=1, timeout=10, retries=0, lanes=[Lane("manga", workers=1)]).start()
+        self.q.set_lane_paused("manga", True)
+        m, d = self.slow("m", "manga"), self.slow("d")
+        self.wait_running(d)  # the default lane isn't held up
+        time.sleep(0.3)
+        self.assertEqual(m.state, "queued")
+        self.assertTrue(self.q.lanes_state()[0]["paused"])
+        self.q.set_lanes([Lane("manga", workers=2)])  # a kept lane stays paused
+        time.sleep(0.3)
+        self.assertEqual(m.state, "queued")
+        self.q.set_lane_paused("manga", False)
+        self.wait_running(m)
+        self.assertFalse(self.q.lanes_state()[0]["paused"])
+        with self.assertRaisesRegex(ValueError, "no download lane 'books'"):
+            self.q.set_lane_paused("books", True)
+
+    def test_removing_a_paused_lane_lets_its_downloads_run(self):
+        self.q = DownloadQueue(workers=1, timeout=10, retries=0, lanes=[Lane("manga")]).start()
+        self.q.set_lane_paused("manga", True)
+        m = self.slow("m", "manga")
+        time.sleep(0.3)
+        self.assertEqual(m.state, "queued")
+        self.q.set_lanes([])
+        self.wait_running(m)
+        self.q.set_lanes([Lane("manga")])
+        self.assertFalse(self.q.lanes_state()[0]["paused"])  # a new lane of the same name starts unpaused
+
+    def fair_order(self, fair):
+        self.q = DownloadQueue(workers=2, timeout=10, retries=0, fair=fair)
+        self.q.set_paused(True)
+        other = self.server.base.replace("127.0.0.1", "localhost")
+        a = [self.q.add([self.server.base + "/slow"], self.folder(f"{fair}a{i}"))[0][0] for i in range(3)]
+        (b,), _ = self.q.add([other + "/slow"], self.folder(f"{fair}b"))
+        self.q.start()
+        self.q.set_paused(False)
+        return a, b
+
+    def test_fair_takes_turns_between_sites(self):
+        a, b = self.fair_order(True)
+        self.wait_running(a[0], b)
+        time.sleep(0.3)
+        self.assertEqual([x.state for x in a[1:]], ["queued", "queued"])
+
+    def test_without_fair_first_queued_first_started(self):
+        a, b = self.fair_order(False)
+        self.wait_running(a[0], a[1])
+        time.sleep(0.3)
+        self.assertEqual(b.state, "queued")
+
     def test_lanes_have_their_own_slots(self):
         self.q = DownloadQueue(workers=1, timeout=10, retries=0, lanes=[Lane("manga", workers=2)]).start()
         default, m1, m2 = self.slow("d"), self.slow("m1", "manga"), self.slow("m2", "manga")

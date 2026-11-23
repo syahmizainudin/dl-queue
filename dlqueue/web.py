@@ -505,6 +505,7 @@ class DownloadAPI:
             "downloads_paused": q.paused,
             "download_workers": q.workers,
             "download_rate": q.rate,
+            "download_fair": q.fair,
             "download_hours": format_hours(q.hours),
             "download_waiting": q.waiting_for_hours(),
             "download_lanes": [{**x, "hours": format_hours(x["hours"])} for x in q.lanes_state()],
@@ -540,4 +541,10 @@ class DownloadAPI:
         if action == "pause":
             q.set_paused(bool(body.get("paused", True)))
             return 200, {"paused": q.paused}
+        if action == "lane-pause":
+            paused = body.get("paused", True)
+            if not isinstance(paused, bool):
+                raise ValueError("paused must be true or false")
+            q.set_lane_paused(str(body.get("name", "")), paused)
+            return 200, {"lanes": [{**x, "hours": format_hours(x["hours"])} for x in q.lanes_state()]}
         return 404, {"error": "not found"}

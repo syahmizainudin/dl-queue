@@ -262,6 +262,11 @@ class Lane:
             raise ValueError("a lane's speed limit must be 0 or more bytes a second")
 
 
+def _site(url: str) -> str:
+    """The host a URL downloads from, for ``fair`` scheduling."""
+    return (urlsplit(url).hostname or "").lower()
+
+
 class DownloadQueue(BaseQueue):
     thread_prefix = "download"
 
@@ -278,6 +283,7 @@ class DownloadQueue(BaseQueue):
         rate: int = 0,
         hours: tuple[int, int] | None = None,
         lanes: list[Lane] | None = None,
+        fair: bool = False,
     ):
         """``check_after`` validates/normalizes ``after`` when jobs are added (raise ValueError).
 
@@ -291,6 +297,10 @@ class DownloadQueue(BaseQueue):
         ``lanes``: named lanes (``Lane``), changed later with ``set_lanes``. A download added with
         no lane, or whose lane was removed, runs in the default lane: ``workers`` at once, with
         ``hours``, exactly as without lanes.
+
+        ``fair``: when a slot frees, start the queued download whose site (host) has the fewest
+        downloads running in its lane, earliest queued first among equals. Off: first queued, first
+        started.
         """
         super().__init__(workers, on_change)
         if retries < 0 or backoff < 0:
@@ -306,6 +316,8 @@ class DownloadQueue(BaseQueue):
         self.hours = hours
         self._lanes: dict[str, Lane] = {}
         self._lane_limiters: dict[str, RateLimiter] = {}
+        self._lanes_paused: set[str] = set()
+        self.fair = bool(fair)
         self._started = False
         self._worker_threads = 0
         if lanes:
@@ -356,8 +368,22 @@ class DownloadQueue(BaseQueue):
                 limiters[x.name] = self._lane_limiters.get(x.name) or RateLimiter()
                 limiters[x.name].rate = x.rate
             self._lane_limiters = limiters
+            self._lanes_paused &= set(self._lanes)
             if self._started:
                 self._grow()
+            self._cond.notify_all()
+
+    def set_lane_paused(self, name: str, paused: bool) -> None:
+        """Pause or resume one lane: while paused none of its queued downloads start; running ones
+        finish. Kept while the lane keeps its name in ``set_lanes``."""
+        name = str(name or "").strip()
+        with self._cond:
+            if name not in self._lanes:
+                raise ValueError(f"there is no download lane {name!r}")
+            if paused:
+                self._lanes_paused.add(name)
+            else:
+                self._lanes_paused.discard(name)
             self._cond.notify_all()
 
     def lanes(self) -> list[Lane]:
@@ -396,31 +422,52 @@ class DownloadQueue(BaseQueue):
                         "running": sum(j.state == "running" for j in jobs),
                         "queued": sum(j.state == QUEUED for j in jobs),
                         "waiting": not in_hours(hours),
+                        "paused": x.name in self._lanes_paused,
                     }
                 )
             return out
 
     def _next_runnable(self):
-        """First pending job whose lane has a free slot and is inside its hours. Call with the lock held."""
+        """First pending job whose lane has a free slot, isn't paused and is inside its hours; with
+        ``fair``, the one whose site has the fewest running downloads in its lane. Call with the lock
+        held."""
         running: dict[str, int] = {}
+        per_site: dict[tuple[str, str], int] = {}
         busy = set()
         for j in self._jobs.values():
             if j.state == "running":
                 lane = self._lane(j)
                 key = lane.name if lane else ""
                 running[key] = running.get(key, 0) + 1
+                site = (key, _site(j.url))
+                per_site[site] = per_site.get(site, 0) + 1
                 busy.add(self._busy_key(j))
         busy.discard(None)
+        best, best_load = None, None
         for jid in self._pending:
             job = self._jobs[jid]
             lane = self._lane(job)
             key, workers = (lane.name, lane.workers) if lane else ("", self.workers)
             hours = lane.hours if lane and lane.hours is not None else self.hours
-            if running.get(key, 0) >= workers or not in_hours(hours) or self._busy_key(job) in busy:
+            if (
+                running.get(key, 0) >= workers
+                or (lane and lane.name in self._lanes_paused)
+                or not in_hours(hours)
+                or self._busy_key(job) in busy
+            ):
                 continue
-            self._pending.remove(jid)
-            return job
-        return None
+            if not self.fair:
+                best = jid
+                break
+            load = per_site.get((key, _site(job.url)), 0)
+            if best_load is None or load < best_load:
+                best, best_load = jid, load
+                if load == 0:
+                    break  # nothing beats a site with nothing running
+        if best is None:
+            return None
+        self._pending.remove(best)
+        return self._jobs[best]
 
     def _take(self, job: Download, n: int) -> bool:
         """Wait for ``n`` bytes of the lane's budget, then the queue's. False if cancelled."""

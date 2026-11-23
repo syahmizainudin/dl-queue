@@ -204,6 +204,7 @@ class WebTests(TmpDir):
                 "downloads_paused": False,
                 "download_workers": 1,
                 "download_rate": 0,
+                "download_fair": False,
                 "download_hours": None,
                 "download_waiting": False,
                 "download_lanes": [],
@@ -239,6 +240,20 @@ class WebTests(TmpDir):
         status, err = self.post("/api/download/add", {**body, "lane": "day"})
         self.assertEqual((status, err), (400, {"error": "there is no download lane 'day'"}))
         self.assertEqual(self.post("/api/download/add", {**body, "lane": 5})[0], 400)
+
+    def test_lane_pause(self):
+        from dlqueue.download import Lane
+
+        self.queue.set_lanes([Lane("night")])
+        status, out = self.post("/api/download/lane-pause", {"name": "night", "paused": True})
+        self.assertEqual((status, out["lanes"][0]["paused"]), (200, True))
+        self.assertTrue(self.state()["download_lanes"][0]["paused"])
+        self.assertEqual(self.post("/api/download/lane-pause", {"name": "night", "paused": False})[0], 200)
+        self.assertFalse(self.state()["download_lanes"][0]["paused"])
+        status, err = self.post("/api/download/lane-pause", {"name": "day"})
+        self.assertEqual((status, err), (400, {"error": "there is no download lane 'day'"}))
+        self.assertEqual(self.post("/api/download/lane-pause", {"name": "night", "paused": "yes"})[0], 400)
+        self.assertFalse(self.state()["download_fair"])
 
     def test_add_validation(self):
         good = {"urls": ["http://127.0.0.1:1/x.zip"], "dest": str(self.dir)}

@@ -2,6 +2,11 @@
 
 Each release has a `## <version>` section. The release pipeline publishes that section as the GitHub release notes, and refuses to release a version without one.
 
+## Unreleased
+
+- **Pause one lane:** `set_lane_paused(name, paused)` and the API's `lane-pause` action (`{name, paused}`). A paused lane starts none of its queued downloads; running ones finish. Kept while the lane keeps its name in `set_lanes`. `download_lanes` in the state adds `paused`.
+- **Taking turns between sites:** `DownloadQueue(fair=True)` and `--fair` on `get` and `ui`: when a slot frees, the next download is the one whose site (host) has the fewest downloads running in its lane, earliest queued first among equals. Off by default. The state adds `download_fair`.
+
 ## 0.6.0
 
 - **Lanes:** `Lane(name, workers, rate, hours)`, `DownloadQueue(lanes=)` and `set_lanes()` (live) give groups of downloads their own number at once, speed limit and quiet hours; `add(..., lane=)` puts downloads in one. A lane's speed limit sits under the queue's, and a lane without hours follows the queue's. Downloads with no lane, or whose lane was removed, run as before. Jobs carry `lane`, retries keep it, and `DownloadAPI` takes `lane` on `add` and reports `download_lanes` (each lane's settings, running, queued and waiting) in its state.
