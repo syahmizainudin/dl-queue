@@ -507,6 +507,7 @@ class DownloadAPI:
             "download_rate": q.rate,
             "download_hours": format_hours(q.hours),
             "download_waiting": q.waiting_for_hours(),
+            "download_lanes": [{**x, "hours": format_hours(x["hours"])} for x in q.lanes_state()],
         }
 
     def post(self, action: str, body: dict) -> tuple[int, dict]:
@@ -523,7 +524,10 @@ class DownloadAPI:
                 raise ValueError("after must be an object")
             auth = Auth(str(a.get("mode", "none")), str(a.get("key", "")), str(a.get("name", "")))
             urls = expand_ranges([str(u) for u in urls])
-            added, dupes = q.add(urls, str(body.get("dest", "")), auth, after=after)
+            lane = body.get("lane") or ""
+            if not isinstance(lane, str):
+                raise ValueError("lane must be a name")
+            added, dupes = q.add(urls, str(body.get("dest", "")), auth, after=after, lane=lane)
             return 200, {"added": len(added), "duplicates": dupes}
         if action == "cancel":
             return 200, {"ok": q.cancel(int(body["id"]))}

@@ -206,6 +206,7 @@ class WebTests(TmpDir):
                 "download_rate": 0,
                 "download_hours": None,
                 "download_waiting": False,
+                "download_lanes": [],
             },
         )
 
@@ -222,6 +223,22 @@ class WebTests(TmpDir):
         (dl,) = st["downloads"]
         self.assertEqual((dl["state"], dl["auth_mode"], dl["name"]), (DONE, "header", "a.zip"))
         self.assertEqual(self.files(), ["a.zip"])
+
+    def test_lanes_in_state_and_add(self):
+        from dlqueue.download import Lane
+
+        self.queue.set_lanes([Lane("night", workers=2, rate=1024, hours=(60, 420))])
+        (lane,) = self.state()["download_lanes"]
+        self.assertEqual(
+            {k: lane[k] for k in ("name", "workers", "rate", "hours", "running", "queued")},
+            {"name": "night", "workers": 2, "rate": 1024, "hours": "01:00-07:00", "running": 0, "queued": 0},
+        )
+        body = {"urls": [self.url("/files/a/b.zip")], "dest": str(self.dir), "lane": "night"}
+        self.assertEqual(self.post("/api/download/add", body)[0], 200)
+        self.assertEqual(self.state()["downloads"][0]["lane"], "night")
+        status, err = self.post("/api/download/add", {**body, "lane": "day"})
+        self.assertEqual((status, err), (400, {"error": "there is no download lane 'day'"}))
+        self.assertEqual(self.post("/api/download/add", {**body, "lane": 5})[0], 400)
 
     def test_add_validation(self):
         good = {"urls": ["http://127.0.0.1:1/x.zip"], "dest": str(self.dir)}

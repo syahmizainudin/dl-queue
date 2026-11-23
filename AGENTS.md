@@ -90,5 +90,6 @@ Both must pass before you hand work back. CI pins ruff (`RUFF_VERSION` in `ci.ym
 ## Speed limit, quiet hours, URL ranges
 
 - `DownloadQueue.limiter` (`RateLimiter`) is shared by every worker; `_attempt` takes from it after each chunk and treats a cancel while waiting as a cancel. `rate` 0 is no limit.
+- Lanes (`Lane`, `set_lanes`) live in `DownloadQueue` too: `_next_runnable` counts running downloads per lane (a job without a lane, or whose lane is gone, counts in the default lane with `workers`), `_take` waits on the lane's `RateLimiter` and then the queue's, and `_grow` starts threads up to `workers` + every lane's workers (capped at `THREADS_MAX`). Threads are never stopped when lanes shrink; the per-lane counts limit them. `set_lanes` keeps a kept lane's limiter so running downloads keep their budget.
 - Quiet hours live in `DownloadQueue._next_runnable` and a `-clock` thread that wakes the workers every 30 s. `BaseQueue` is shared with cbz-webp, so never put them there.
 - `expand_ranges` (in `web.py`, outside the generic server part) runs on the API's and `get`'s URL lists before `add`, capped at `MAX_EXPANDED`.

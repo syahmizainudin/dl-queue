@@ -4,6 +4,8 @@ Each release has a `## <version>` section. The release pipeline publishes that s
 
 ## Unreleased
 
+- **Lanes:** `Lane(name, workers, rate, hours)`, `DownloadQueue(lanes=)` and `set_lanes()` (live) give groups of downloads their own number at once, speed limit and quiet hours; `add(..., lane=)` puts downloads in one. A lane's speed limit sits under the queue's, and a lane without hours follows the queue's. Downloads with no lane, or whose lane was removed, run as before. Jobs carry `lane`, retries keep it, and `DownloadAPI` takes `lane` on `add` and reports `download_lanes` (each lane's settings, running, queued and waiting) in its state.
+
 ## 0.5.1
 
 - **Speed limit:** `--rate 5M` (or `DownloadQueue(rate=)`) shares one byte budget between all downloads. Cancelling still works while a download waits for its share.

@@ -12,7 +12,7 @@ from unittest import mock
 from helpers import FileServer
 
 from dlqueue.basequeue import CANCELLED, DONE, FAILED
-from dlqueue.download import Auth, DownloadQueue, disposition_name, safe_name
+from dlqueue.download import Auth, DownloadQueue, Lane, disposition_name, safe_name
 
 KEY = FileServer.KEY
 
@@ -487,6 +487,129 @@ class SpeedAndHoursTests(unittest.TestCase):
             self.q._cond.notify_all()
         self.q.wait_idle()
         self.assertEqual(job.state, DONE)
+
+
+class LaneTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.dir = Path(self.tmp.name)
+        self.server = FileServer()
+        self.q = None
+
+    def tearDown(self):
+        if self.q:
+            self.q.shutdown()
+        self.server.close()
+        self.tmp.cleanup()
+
+    def folder(self, name):
+        d = self.dir / name
+        d.mkdir()
+        return d
+
+    def slow(self, folder, lane=""):
+        (job,), _ = self.q.add([self.server.base + "/slow"], self.folder(folder), lane=lane)
+        return job
+
+    def wait_running(self, *jobs):
+        deadline = time.monotonic() + 10
+        while any(j.state != "running" for j in jobs) and time.monotonic() < deadline:
+            time.sleep(0.02)
+        self.assertEqual([j.state for j in jobs], ["running"] * len(jobs))
+
+    def closed_hours(self):
+        now = time.localtime()
+        minute = now.tm_hour * 60 + now.tm_min
+        return ((minute + 60) % 1440, (minute + 120) % 1440)  # an hour from now, for an hour
+
+    def test_lanes_have_their_own_slots(self):
+        self.q = DownloadQueue(workers=1, timeout=10, retries=0, lanes=[Lane("manga", workers=2)]).start()
+        default, m1, m2 = self.slow("d"), self.slow("m1", "manga"), self.slow("m2", "manga")
+        self.wait_running(default, m1, m2)  # the default lane's one slot doesn't hold up the lane
+        m3, d2 = self.slow("m3", "manga"), self.slow("d2")
+        time.sleep(0.4)
+        self.assertEqual((m3.state, d2.state), ("queued", "queued"))  # each lane is full
+        lanes = {x["name"]: x for x in self.q.lanes_state()}
+        self.assertEqual((lanes["manga"]["running"], lanes["manga"]["queued"]), (2, 1))
+        self.assertEqual((m1.lane, default.lane), ("manga", ""))
+        self.q.cancel_all()
+        self.q.wait_idle()
+
+    def test_lane_hours_hold_only_that_lane(self):
+        lane = Lane("night", workers=1, hours=self.closed_hours())
+        self.q = DownloadQueue(workers=1, timeout=10, retries=0, lanes=[lane]).start()
+        (night,), _ = self.q.add([self.server.base + "/files/a/x.bin"], self.folder("n"), lane="night")
+        (day,), _ = self.q.add([self.server.base + "/files/a/y.bin"], self.folder("d"))
+        deadline = time.monotonic() + 10
+        while day.state != DONE and time.monotonic() < deadline:
+            time.sleep(0.02)
+        self.assertEqual((day.state, night.state), (DONE, "queued"))
+        self.assertTrue(self.q.lanes_state()[0]["waiting"])
+        self.assertFalse(self.q.waiting_for_hours())
+        self.q.set_lanes([Lane("night", workers=1)])  # no hours of its own: the queue's (none)
+        self.q.wait_idle()
+        self.assertEqual(night.state, DONE)
+
+    def test_lane_without_hours_follows_the_queue(self):
+        self.q = DownloadQueue(workers=1, timeout=10, retries=0, hours=self.closed_hours(), lanes=[Lane("a")])
+        self.q.start()
+        (job,), _ = self.q.add([self.server.base + "/files/a/x.bin"], self.folder("a"), lane="a")
+        time.sleep(0.4)
+        self.assertEqual(job.state, "queued")
+        self.assertTrue(self.q.lanes_state()[0]["waiting"])
+
+    def test_removed_lane_runs_in_the_default_lane(self):
+        self.q = DownloadQueue(workers=1, timeout=10, retries=0, lanes=[Lane("a", hours=self.closed_hours())])
+        self.q.start()
+        (job,), _ = self.q.add([self.server.base + "/files/a/x.bin"], self.folder("a"), lane="a")
+        time.sleep(0.3)
+        self.assertEqual(job.state, "queued")
+        self.q.set_lanes([])
+        self.q.wait_idle()
+        self.assertEqual(job.state, DONE)
+        with self.assertRaisesRegex(ValueError, "no download lane"):
+            self.q.add([self.server.base + "/files/a/z.bin"], self.dir, lane="a")
+
+    def test_set_lanes_adds_threads_and_keeps_budgets(self):
+        self.q = DownloadQueue(workers=1, timeout=10, retries=0).start()
+
+        def threads():
+            return sum(t.name.startswith("download-") and t.name[9:].isdigit() for t in self.q._threads)
+
+        self.assertEqual(threads(), 1)
+        self.q.set_lanes([Lane("a", workers=3, rate=1000), Lane("b", workers=2)])
+        self.assertEqual(threads(), 6)
+        budget = self.q._lane_limiters["a"]
+        self.q.set_lanes([Lane("a", workers=1, rate=5000)])
+        self.assertEqual(threads(), 6)  # spare threads wait; the lane's count is what limits it
+        self.assertIs(self.q._lane_limiters["a"], budget)
+        self.assertEqual(budget.rate, 5000)
+        self.assertNotIn("b", self.q._lane_limiters)
+
+    def test_retry_keeps_the_lane(self):
+        self.q = DownloadQueue(workers=1, timeout=10, retries=0, lanes=[Lane("a")]).start()
+        (job,), _ = self.q.add([self.server.base + "/always500"], self.folder("a"), lane="a")
+        self.q.wait_idle()
+        self.assertEqual(job.state, FAILED)
+        self.q.retry(job.id)
+        self.assertEqual(self.q._jobs[job.id].lane, "a")
+
+    def test_lane_checks(self):
+        for bad in (
+            dict(name=""),
+            dict(name="x" * 41),
+            dict(name="a\nb"),
+            dict(name="a", workers=0),
+            dict(name="a", workers=17),
+            dict(name="a", workers=True),
+            dict(name="a", rate=-1),
+        ):
+            with self.subTest(bad=bad), self.assertRaises(ValueError):
+                Lane(**bad)
+        q = DownloadQueue()
+        with self.assertRaisesRegex(ValueError, "different"):
+            q.set_lanes([Lane("A"), Lane("a")])
+        self.assertEqual(Lane("  b  ").name, "b")
 
 
 class RangeTests(unittest.TestCase):

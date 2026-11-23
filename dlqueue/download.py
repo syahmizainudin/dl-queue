@@ -136,6 +136,7 @@ class Download:
     dest_dir: str
     auth: Auth = field(repr=False)
     after: dict = field(default_factory=dict)  # options for the on_saved hook; never secret
+    lane: str = ""  # the lane it runs in; "" is the queue's own (default) lane
     state: str = QUEUED
     done: int = 0  # bytes received
     total: int = 0  # Content-Length, 0 when the server did not send one
@@ -167,6 +168,7 @@ class Download:
             self.dest_dir,
             self.auth,
             dict(self.after),
+            self.lane,
         )
 
 
@@ -232,6 +234,34 @@ class RateLimiter:
                 return False
 
 
+LANE_NAME_MAX = 40
+LANE_WORKERS_MAX = 16
+THREADS_MAX = 64  # worker threads in all; lanes past this share the threads there are
+
+
+@dataclass
+class Lane:
+    """A named lane: at most ``workers`` of its downloads run at once, at most ``rate`` bytes a second
+    for the lane (0: no limit of its own; the queue's limit still covers every download), and new
+    ones start only in ``hours`` (None: the queue's hours)."""
+
+    name: str
+    workers: int = 1
+    rate: int = 0
+    hours: tuple[int, int] | None = None
+
+    def __post_init__(self) -> None:
+        self.name = str(self.name).strip()
+        if not self.name or len(self.name) > LANE_NAME_MAX or any(ord(c) < 32 for c in self.name):
+            raise ValueError(f"a lane name is 1-{LANE_NAME_MAX} characters")
+        if not isinstance(self.workers, int) or isinstance(self.workers, bool):
+            raise ValueError("a lane's workers must be a whole number")
+        if not 1 <= self.workers <= LANE_WORKERS_MAX:
+            raise ValueError(f"a lane runs 1-{LANE_WORKERS_MAX} downloads at once")
+        if not isinstance(self.rate, int) or isinstance(self.rate, bool) or self.rate < 0:
+            raise ValueError("a lane's speed limit must be 0 or more bytes a second")
+
+
 class DownloadQueue(BaseQueue):
     thread_prefix = "download"
 
@@ -247,6 +277,7 @@ class DownloadQueue(BaseQueue):
         on_change: Callable | None = None,
         rate: int = 0,
         hours: tuple[int, int] | None = None,
+        lanes: list[Lane] | None = None,
     ):
         """``check_after`` validates/normalizes ``after`` when jobs are added (raise ValueError).
 
@@ -256,6 +287,10 @@ class DownloadQueue(BaseQueue):
         ``rate``: bytes a second for all downloads together (0: no limit; ``parse_size``).
         ``hours``: (start, end) minutes after midnight (``parse_hours``): outside them no new
         download starts, and running ones finish.
+
+        ``lanes``: named lanes (``Lane``), changed later with ``set_lanes``. A download added with
+        no lane, or whose lane was removed, runs in the default lane: ``workers`` at once, with
+        ``hours``, exactly as without lanes.
         """
         super().__init__(workers, on_change)
         if retries < 0 or backoff < 0:
@@ -269,6 +304,12 @@ class DownloadQueue(BaseQueue):
         self._names = threading.Lock()  # guards _reserved; keeps filesystem checks off _cond
         self.limiter = RateLimiter(rate)
         self.hours = hours
+        self._lanes: dict[str, Lane] = {}
+        self._lane_limiters: dict[str, RateLimiter] = {}
+        self._started = False
+        self._worker_threads = 0
+        if lanes:
+            self.set_lanes(lanes)
 
     @property
     def rate(self) -> int:
@@ -280,6 +321,10 @@ class DownloadQueue(BaseQueue):
 
     def start(self):
         super().start()
+        with self._cond:
+            self._started = True
+            self._worker_threads = self.workers
+            self._grow()
         # Workers sleep until something changes; with hours, wake them when a window may open.
         t = threading.Thread(target=self._clock, name=f"{self.thread_prefix}-clock", daemon=True)
         t.start()
@@ -290,13 +335,99 @@ class DownloadQueue(BaseQueue):
         with self._cond:
             while not self._stopping:
                 self._cond.wait(30)
-                if self.hours is not None and self._pending:
+                has_hours = self.hours is not None or any(x.hours is not None for x in self._lanes.values())
+                if has_hours and self._pending:
                     self._cond.notify_all()
 
+    # ------------------------------------------------------------ lanes
+    def set_lanes(self, lanes: list[Lane]) -> None:
+        """Replace the lanes, live. A lane that keeps its name keeps its byte budget; a running
+        download keeps running. Queued downloads of a removed lane run in the default lane."""
+        lanes = list(lanes)
+        if any(not isinstance(x, Lane) for x in lanes):
+            raise ValueError("lanes must be Lane objects")
+        names = [x.name.lower() for x in lanes]
+        if len(set(names)) != len(names):
+            raise ValueError("lane names must be different")
+        with self._cond:
+            self._lanes = {x.name: x for x in lanes}
+            limiters = {}
+            for x in lanes:
+                limiters[x.name] = self._lane_limiters.get(x.name) or RateLimiter()
+                limiters[x.name].rate = x.rate
+            self._lane_limiters = limiters
+            if self._started:
+                self._grow()
+            self._cond.notify_all()
+
+    def lanes(self) -> list[Lane]:
+        with self._cond:
+            return list(self._lanes.values())
+
+    def _grow(self) -> None:
+        """Start worker threads up to the default lane's workers plus every lane's. Call with the lock
+        held. Threads aren't stopped when lanes shrink: ``_next_runnable`` counts each lane's running
+        downloads, so a spare thread just waits."""
+        want = min(THREADS_MAX, self.workers + sum(x.workers for x in self._lanes.values()))
+        while self._worker_threads < want:
+            n = self._worker_threads
+            t = threading.Thread(target=self._worker, name=f"{self.thread_prefix}-{n}", daemon=True)
+            t.start()
+            self._threads.append(t)
+            self._worker_threads += 1
+
+    def _lane(self, job: Download) -> Lane | None:
+        """The job's lane, or None for the default lane (no lane, or a lane since removed)."""
+        return self._lanes.get(job.lane) if job.lane else None
+
+    def lanes_state(self) -> list[dict]:
+        """Each lane with its settings and how many of its downloads run and wait."""
+        with self._cond:
+            out = []
+            for x in self._lanes.values():
+                jobs = [j for j in self._jobs.values() if j.lane == x.name]
+                hours = x.hours if x.hours is not None else self.hours
+                out.append(
+                    {
+                        "name": x.name,
+                        "workers": x.workers,
+                        "rate": x.rate,
+                        "hours": x.hours,
+                        "running": sum(j.state == "running" for j in jobs),
+                        "queued": sum(j.state == QUEUED for j in jobs),
+                        "waiting": not in_hours(hours),
+                    }
+                )
+            return out
+
     def _next_runnable(self):
-        if not in_hours(self.hours):
-            return None
-        return super()._next_runnable()
+        """First pending job whose lane has a free slot and is inside its hours. Call with the lock held."""
+        running: dict[str, int] = {}
+        busy = set()
+        for j in self._jobs.values():
+            if j.state == "running":
+                lane = self._lane(j)
+                key = lane.name if lane else ""
+                running[key] = running.get(key, 0) + 1
+                busy.add(self._busy_key(j))
+        busy.discard(None)
+        for jid in self._pending:
+            job = self._jobs[jid]
+            lane = self._lane(job)
+            key, workers = (lane.name, lane.workers) if lane else ("", self.workers)
+            hours = lane.hours if lane and lane.hours is not None else self.hours
+            if running.get(key, 0) >= workers or not in_hours(hours) or self._busy_key(job) in busy:
+                continue
+            self._pending.remove(jid)
+            return job
+        return None
+
+    def _take(self, job: Download, n: int) -> bool:
+        """Wait for ``n`` bytes of the lane's budget, then the queue's. False if cancelled."""
+        lane = self._lane_limiters.get(job.lane) if job.lane else None
+        if lane is not None and not lane.take(n, job.cancel):
+            return False
+        return self.limiter.take(n, job.cancel)
 
     # ------------------------------------------------------------ commands
     def add(
@@ -306,8 +437,10 @@ class DownloadQueue(BaseQueue):
         auth: Auth | None = None,
         *,
         after: dict | None = None,
+        lane: str = "",
     ) -> tuple[list[Download], int]:
-        """Queue each URL not already queued/running for the same folder. Returns (added, dupes)."""
+        """Queue each URL not already queued/running for the same folder, in ``lane`` ("" for the
+        default lane). Returns (added, dupes)."""
         urls = [check_url(u) for u in urls if u.strip()]
         if not urls:
             raise ValueError("give at least one URL")
@@ -320,8 +453,11 @@ class DownloadQueue(BaseQueue):
         if self.check_after:
             after = self.check_after(after)
         auth = (auth or Auth()).validate()
+        lane = str(lane or "").strip()
         added, dupes = [], 0
         with self._cond:
+            if lane and lane not in self._lanes:
+                raise ValueError(f"there is no download lane {lane!r}")
             active = {self._dedup_key(j) for j in self._jobs.values() if j.state in ACTIVE}
             for url in urls:
                 if (url, str(dest)) in active:
@@ -335,6 +471,7 @@ class DownloadQueue(BaseQueue):
                         str(dest),
                         auth,
                         dict(after),
+                        lane,
                     )
                 )
             self._enqueue(added)
@@ -481,7 +618,7 @@ class DownloadQueue(BaseQueue):
                         chunk = resp.read(CHUNK)
                         if not chunk:
                             break
-                        if job.cancel.is_set() or not self.limiter.take(len(chunk), job.cancel):
+                        if job.cancel.is_set() or not self._take(job, len(chunk)):
                             raise DownloadCancelled()
                         f.write(chunk)
                         job.done += len(chunk)
