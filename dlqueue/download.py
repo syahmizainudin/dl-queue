@@ -137,6 +137,9 @@ class Download:
     auth: Auth = field(repr=False)
     after: dict = field(default_factory=dict)  # options for the on_saved hook; never secret
     lane: str = ""  # the lane it runs in; "" is the queue's own (default) lane
+    # A reference the host turns into an Auth at each attempt (``DownloadQueue(auth_for=)``), so a
+    # saved key never sits on the job. Never secret itself.
+    auth_ref: str = ""
     state: str = QUEUED
     done: int = 0  # bytes received
     total: int = 0  # Content-Length, 0 when the server did not send one
@@ -169,6 +172,7 @@ class Download:
             self.auth,
             dict(self.after),
             self.lane,
+            self.auth_ref,
         )
 
 
@@ -234,6 +238,7 @@ class RateLimiter:
                 return False
 
 
+AUTH_REF_MAX = 200
 LANE_NAME_MAX = 40
 LANE_WORKERS_MAX = 16
 THREADS_MAX = 64  # worker threads in all; lanes past this share the threads there are
@@ -284,6 +289,7 @@ class DownloadQueue(BaseQueue):
         hours: tuple[int, int] | None = None,
         lanes: list[Lane] | None = None,
         fair: bool = False,
+        auth_for: Callable[[Download], Auth | None] | None = None,
     ):
         """``check_after`` validates/normalizes ``after`` when jobs are added (raise ValueError).
 
@@ -301,6 +307,10 @@ class DownloadQueue(BaseQueue):
         ``fair``: when a slot frees, start the queued download whose site (host) has the fewest
         downloads running in its lane, earliest queued first among equals. Off: first queued, first
         started.
+
+        ``auth_for``: for a download added with an ``auth_ref``, called at each attempt (outside the
+        queue's lock) to get the Auth to send. None sends the download's own ``auth``; a ValueError
+        fails the download with its message.
         """
         super().__init__(workers, on_change)
         if retries < 0 or backoff < 0:
@@ -318,6 +328,7 @@ class DownloadQueue(BaseQueue):
         self._lane_limiters: dict[str, RateLimiter] = {}
         self._lanes_paused: set[str] = set()
         self.fair = bool(fair)
+        self.auth_for = auth_for
         self._started = False
         self._worker_threads = 0
         if lanes:
@@ -485,9 +496,10 @@ class DownloadQueue(BaseQueue):
         *,
         after: dict | None = None,
         lane: str = "",
+        auth_ref: str = "",
     ) -> tuple[list[Download], int]:
         """Queue each URL not already queued/running for the same folder, in ``lane`` ("" for the
-        default lane). Returns (added, dupes)."""
+        default lane), with ``auth_ref`` for ``auth_for``. Returns (added, dupes)."""
         urls = [check_url(u) for u in urls if u.strip()]
         if not urls:
             raise ValueError("give at least one URL")
@@ -501,6 +513,9 @@ class DownloadQueue(BaseQueue):
             after = self.check_after(after)
         auth = (auth or Auth()).validate()
         lane = str(lane or "").strip()
+        auth_ref = str(auth_ref or "")
+        if len(auth_ref) > AUTH_REF_MAX or any(ord(c) < 32 for c in auth_ref):
+            raise ValueError(f"auth_ref is at most {AUTH_REF_MAX} characters on one line")
         added, dupes = [], 0
         with self._cond:
             if lane and lane not in self._lanes:
@@ -519,6 +534,7 @@ class DownloadQueue(BaseQueue):
                         auth,
                         dict(after),
                         lane,
+                        auth_ref,
                     )
                 )
             self._enqueue(added)
@@ -612,9 +628,20 @@ class DownloadQueue(BaseQueue):
         if state["part"] is not None:
             state["part"].unlink(missing_ok=True)
 
+    def _auth(self, job: Download) -> Auth:
+        """The Auth for this attempt: from ``auth_for`` when the job has an ``auth_ref``."""
+        if job.auth_ref and self.auth_for is not None:
+            try:
+                auth = self.auth_for(job)
+                if auth is not None:
+                    return auth.validate()
+            except ValueError as e:
+                raise DownloadError(str(e)) from None
+        return job.auth
+
     def _attempt(self, job: Download, state: dict) -> None:
         """One request. Raises _Transient for failures worth retrying; renames the .part when done."""
-        url, headers = job.auth.apply(job.url)
+        url, headers = self._auth(job).apply(job.url)
         req = Request(url, headers={"User-Agent": USER_AGENT})
         for k, v in headers.items():
             req.add_unredirected_header(k, v)  # not re-sent on redirect

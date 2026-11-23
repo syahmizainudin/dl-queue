@@ -2,6 +2,10 @@
 
 Each release has a `## <version>` section. The release pipeline publishes that section as the GitHub release notes, and refuses to release a version without one.
 
+## Unreleased
+
+- **Keys from the host at each attempt:** `DownloadQueue(auth_for=)` and `add(..., auth_ref=)`. A download added with an `auth_ref` (a non-secret reference, at most 200 characters) asks `auth_for(job)` for its `Auth` at every attempt, retries included, so a host can keep keys out of the job and its saved state. None sends the download's own `auth`; a `ValueError` fails the download with its message. Jobs show `auth_ref` in their state, and `DownloadAPI`'s `add` takes it.
+
 ## 0.6.1
 
 - **Pause one lane:** `set_lane_paused(name, paused)` and the API's `lane-pause` action (`{name, paused}`). A paused lane starts none of its queued downloads; running ones finish. Kept while the lane keeps its name in `set_lanes`. `download_lanes` in the state adds `paused`.

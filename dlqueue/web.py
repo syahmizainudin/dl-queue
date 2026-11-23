@@ -528,7 +528,12 @@ class DownloadAPI:
             lane = body.get("lane") or ""
             if not isinstance(lane, str):
                 raise ValueError("lane must be a name")
-            added, dupes = q.add(urls, str(body.get("dest", "")), auth, after=after, lane=lane)
+            auth_ref = body.get("auth_ref") or ""
+            if not isinstance(auth_ref, str):
+                raise ValueError("auth_ref must be text")
+            added, dupes = q.add(
+                urls, str(body.get("dest", "")), auth, after=after, lane=lane, auth_ref=auth_ref
+            )
             return 200, {"added": len(added), "duplicates": dupes}
         if action == "cancel":
             return 200, {"ok": q.cancel(int(body["id"]))}

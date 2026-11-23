@@ -255,6 +255,12 @@ class WebTests(TmpDir):
         self.assertEqual(self.post("/api/download/lane-pause", {"name": "night", "paused": "yes"})[0], 400)
         self.assertFalse(self.state()["download_fair"])
 
+    def test_add_with_auth_ref(self):
+        body = {"urls": [self.url("/files/r.zip")], "dest": str(self.dir), "auth_ref": "auto"}
+        self.assertEqual(self.post("/api/download/add", body)[0], 200)
+        self.assertEqual(self.state()["downloads"][0]["auth_ref"], "auto")
+        self.assertEqual(self.post("/api/download/add", {**body, "auth_ref": 1})[0], 400)
+
     def test_add_validation(self):
         good = {"urls": ["http://127.0.0.1:1/x.zip"], "dest": str(self.dir)}
         cases = [

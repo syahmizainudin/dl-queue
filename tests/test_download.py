@@ -489,6 +489,77 @@ class SpeedAndHoursTests(unittest.TestCase):
         self.assertEqual(job.state, DONE)
 
 
+class AuthForTests(unittest.TestCase):
+    """auth_for: the host turns a job's auth_ref into the key at each attempt."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.dir = Path(self.tmp.name)
+        self.server = FileServer()
+        self.q = None
+
+    def tearDown(self):
+        if self.q:
+            self.q.shutdown()
+        self.server.close()
+        self.tmp.cleanup()
+
+    def run_one(self, url, auth_for, auth_ref="site", retries=0):
+        self.q = DownloadQueue(workers=1, timeout=10, retries=retries, backoff=0, auth_for=auth_for).start()
+        (job,), _ = self.q.add([url], self.dir, auth_ref=auth_ref)
+        self.q.wait_idle()
+        return job
+
+    def test_key_from_the_hook(self):
+        seen = []
+
+        def auth_for(job):
+            seen.append(job.auth_ref)
+            return Auth("bearer", FileServer.KEY)
+
+        job = self.run_one(self.server.base + "/secure/a.zip", auth_for)
+        self.assertEqual(job.state, DONE, job.message)
+        self.assertEqual(seen, ["site"])
+        d = job.to_dict()
+        self.assertEqual((d["auth_ref"], d["auth_mode"]), ("site", "none"))
+        self.assertNotIn(FileServer.KEY, json.dumps(d))
+
+    def test_called_on_every_attempt_and_kept_on_retry(self):
+        calls = []
+
+        def auth_for(job):
+            calls.append(job.attempts)
+            return None
+
+        job = self.run_one(self.server.base + "/flaky/1/b.zip", auth_for, retries=1)
+        self.assertEqual(job.state, DONE, job.message)
+        self.assertEqual(len(calls), 2)  # the first try and the retry
+        self.assertEqual(job.fresh().auth_ref, "site")
+
+    def test_none_sends_the_jobs_own_auth(self):
+        job = self.run_one(self.server.base + "/secure/c.zip", lambda job: None)
+        self.assertEqual(job.state, FAILED)
+        self.assertIn("401", job.message)
+
+    def test_hook_error_fails_the_download_with_its_message(self):
+        def auth_for(job):
+            raise ValueError("no key for this site")
+
+        job = self.run_one(self.server.base + "/files/d.zip", auth_for, retries=2)
+        self.assertEqual((job.state, job.message), (FAILED, "no key for this site"))
+
+    def test_no_ref_no_call(self):
+        called = []
+        job = self.run_one(self.server.base + "/files/e.zip", lambda job: called.append(1), auth_ref="")
+        self.assertEqual((job.state, called), (DONE, []))
+
+    def test_bad_ref_refused(self):
+        self.q = DownloadQueue(workers=1)
+        for bad in ("a\nb", "x" * 201):
+            with self.assertRaises(ValueError):
+                self.q.add([self.server.base + "/files/f.zip"], self.dir, auth_ref=bad)
+
+
 class LaneTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
